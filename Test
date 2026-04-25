@@ -1,0 +1,326 @@
+# nexus_auto_fix.py — GPT Generation Prompt
+
+### Automated Maven POM Vulnerability Remediation | DevSecOps Pipeline Integration
+
+-----
+
+> **How to use this file**
+> Copy the SYSTEM block and USER block below into GPT exactly as written.
+> Fill in the two `[ ]` placeholders in Section 14 before sending.
+> Recommended: Temperature = 0.2 | Max tokens = 16,000+
+
+-----
+
+-----
+
+## ═══════════════════════════════
+
+## SYSTEM BLOCK  (paste as System message)
+
+## ═══════════════════════════════
+
+```
+You are a senior DevSecOps engineer and Java/Maven expert specialising in automated
+vulnerability remediation pipelines. You write production-grade Python that is
+defensive, atomic, and audit-friendly.
+
+Rules that can never be broken:
+  - Every function must be fully implemented. No pass, no # TODO, no stubs.
+  - Use only stdlib + requests + packaging.version. No other third-party deps.
+  - All HTTP calls: timeout=30, 3 retries with exponential backoff.
+  - Semver comparison: packaging.version.Version only. Never string comparison.
+  - Log every decision: tier, artifact, version, confidence, reason via logging.
+  - Thread-safe for parallel repo processing.
+  - Handle malformed POM XML gracefully: log and skip, never crash the pipeline.
+```
+
+-----
+
+-----
+
+## ═══════════════════════════════
+
+## USER BLOCK  (paste as User message)
+
+## ═══════════════════════════════
+
+-----
+
+## 1  Task
+
+Generate a complete, production-ready Python script called `nexus_auto_fix.py`.
+
+This script must integrate cleanly into an **existing** Azure DevOps + Tekton pipeline
+by reading the existing scripts, detecting what has already been done, and applying only
+the fix-resolution changes. It must **not** duplicate or replace any existing pipeline step.
+
+-----
+
+## 2  Existing Pipeline — Do NOT Replicate These Steps
+
+The following steps are already fully implemented in the existing pipeline scripts.
+The generated script must call or cooperate with them — never replace them:
+
+|Existing Step                  |What it does                                                               |
+|-------------------------------|---------------------------------------------------------------------------|
+|Entry Mode Selection           |Reports mode (default) or User mode via xlsx/csv rules                     |
+|ACS_MODE enforcement           |ACS_MODE flag, KB init, cert import, Python detection                      |
+|PDF/YAML parse                 |Fetch app list, ACS xlsx parse, PDF parse per repo                         |
+|Repo clone                     |Clones each repo — pom.xml already exists at the path passed to this script|
+|ACS-only fix pass              |Already applied before this script runs                                    |
+|Spring BOM special-case        |Detect BOM-managed, patch spring.boot.version                              |
+|Ownership & context enforcement|Context classification, ownership checks, mechanism guardrails             |
+|Maven build + smoke test       |mvn package, extract_k8s_env.sh, java -jar smoke test                      |
+|Commit & push                  |git add/commit/push, patch azure-pipelines.yml, bump SNAPSHOT              |
+|KB stage                       |Only if pom changed + build passed + scan clean; kb_manager.py; Rules 4+5  |
+|Post-push                      |manage_ado_pipeline.sh, watch_tekton_acs_after_push.sh, eligible_for_jar   |
+|NexusIQ CLI scan gate          |Already integrated — do NOT add another scan step                          |
+
+-----
+
+## 3  The Script’s Sole Responsibility
+
+The script owns **only the Fix Resolution phase**. It must:
+
+- Read the existing `pom.xml` from the already-cloned repo path passed as an argument
+- Accept a list of `Vulnerability` objects produced by the existing scan integration
+- Resolve each vulnerability independently through the 5-tier chain (Section 5)
+- Write the patched `pom.xml` atomically once all decisions are validated
+- Return `fixed[]`, `skipped[]`, `suppressed[]` to the caller for use in the commit message and KB stage
+
+-----
+
+## 4  Partial Fix Guarantee  ← Most Critical Requirement
+
+The script MUST guarantee partial fixes:
+
+- Fix **every** vulnerability it can fix, **independently** of others
+- **Never abort** the entire run because some vulnerabilities have no fix
+- Collect all fix decisions first, conflict-check them, then write the POM **exactly once** (atomic)
+- Cleanly skip unfixable vulnerabilities and log them with reason
+- Return three separate lists: `fixed[]`, `skipped[]`, `suppressed[]`
+
+The top-level function signature must be:
+
+```python
+def process_all_vulnerabilities(
+    vulns: list[Vulnerability],
+    pom_path: str
+) -> tuple[list, list, list]:   # fixed, skipped, suppressed
+    ...
+    # Tier resolution runs independently per vuln
+    # Conflict check runs across all queued decisions
+    # Single atomic POM write at the end
+    # Returns three lists regardless of how many failed
+```
+
+-----
+
+## 5  Five-Tier Resolution Chain
+
+For each vulnerability attempt tiers in order, stopping at the first success:
+
+|Tier|Name                           |Confidence|Description                                                                                                                                                                                                                                                                                                                                   |
+|----|-------------------------------|----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|T1  |KB Exact Match                 |0.99      |Look up `groupId:artifactId` + current version + CVE IDs in local KB cache. If found, use pre-validated safe version directly.                                                                                                                                                                                                                |
+|T2  |NexusIQ Remediation API        |0.90      |Call NexusIQ REST API for remediation recommendation. Only accept if recommended version covers **ALL** CVE IDs for that artifact. Fall through if `NO_FIX` or partial coverage.                                                                                                                                                              |
+|T3  |Maven Central Safe Version Scan|0.75      |**KEY tier for “no fix available” cases.** Query Maven Central for all versions > current. Sort ascending (semver-aware, not lexicographic). For each candidate call NexusIQ component risk API. Return the **lowest** version whose max severity is not CRITICAL or HIGH. This catches fixes NexusIQ hasn’t mapped to a remediation path yet.|
+|T4  |Exclusion Strategy             |0.70      |Used when artifact is transitive and no safe version exists anywhere. If 1–2 parents pull it in: add per-parent `<exclusion>` tags. If 3+ parents: add `<dependencyManagement>` override (cleaner, global). Always add a safe direct `<dependency>` after excluding.                                                                          |
+|T5  |ACS Suppress + Audit Trail     |0.40      |Last resort only. Log CVE, artifact, reason, timestamp to suppression audit file. Add to `suppressed[]` list, never to `fixed[]`.                                                                                                                                                                                                             |
+
+-----
+
+## 6  POM Surgery Rules
+
+Apply fixes in this **exact order** to avoid conflicts:
+
+1. Property patches first (`<properties>` block, e.g. `spring-security.version`)
+1. `<dependencyManagement>` overrides second
+1. Direct `<dependency>` version upgrades third
+1. `<exclusion>` tags last
+
+Additional rules:
+
+- Preserve all existing XML formatting, comments, and namespace declarations
+- Never write to the real `pom.xml` until all decisions are validated — work on a deep copy
+- Save `pom.xml.bak` before writing
+- If the post-write XML fails to parse, restore from `.bak` automatically
+- Never double-add an exclusion or managed dep that already exists
+- Detect and preserve Maven XML namespaces correctly
+
+-----
+
+## 7  Spring BOM Special Case
+
+- Detect if artifact is managed by Spring BOM
+- If yes: find the correct `<property>` key (e.g. `spring-security.version`, `jackson.version`)
+- Patch the property value, not the `<dependency>` version directly
+- Validate that the new property value actually resolves to the safe target version
+
+-----
+
+## 8  Conflict Resolution
+
+Before writing the POM, check all queued decisions for:
+
+- Two fixes targeting the same artifact at different versions → keep the **higher** semver
+- A Spring BOM property bump that would **downgrade** another managed artifact → flag and skip the bump, use direct override instead
+- Log all conflicts resolved and how
+
+-----
+
+## 9  Rollback and Build Bisect
+
+- Always save `pom.xml.bak` before any write
+- Expose `bisect_rollback(decisions, pom_path)` as a **public function** so the existing Maven build step can call it if the build fails
+- `bisect_rollback()` removes the most recently applied fix and returns revised decisions
+- Never silently swallow a rollback — always log which fix was rolled back and why
+
+-----
+
+## 10  KB Feedback Loop
+
+Expose `get_kb_feedback(fixed, skipped)` returning:
+
+- For each fixed vuln: `{ga, from_version, to_version, tier_used}` — caller stages this to KB
+- For each skipped vuln: `{ga, version, reason}` — caller marks as no-fix in KB to skip future scans
+
+This prevents re-scanning known no-fix artifacts on subsequent pipeline runs.
+
+-----
+
+## 11  Commit Message Integration
+
+Expose `generate_commit_message(fixed, skipped, suppressed)` returning a string in this format:
+
+```
+fix(security): auto-remediate vulnerabilities [15 scanned]
+
+Fixed (12): commons-text:1.9->1.10, log4j-core:2.14->2.17.1, ...
+Skipped (2): guava:31.0 [no safe version], ...
+Suppressed (1): CVE-2024-XXXXX [no fix exists, ACS audit logged]
+Tiers used: KB=3, NexusIQ=5, MavenScan=3, Exclusion=1
+```
+
+-----
+
+## 12  Required Data Structures
+
+Use these exact dataclasses — do not simplify or merge them:
+
+```python
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+class FixTier(Enum):
+    KB_EXACT       = 1
+    NEXUSIQ_API    = 2
+    MAVEN_SAFE_VER = 3
+    EXCLUSION      = 4
+    ACS_OVERLAY    = 5
+    NO_FIX         = 99
+
+@dataclass
+class Vulnerability:
+    group_id:        str
+    artifact_id:     str
+    current_version: str
+    cve_ids:         list[str]
+    is_transitive:   bool
+    parent_chain:    list[str]   # which deps pull this in
+    severity:        str         # CRITICAL / HIGH / MEDIUM / LOW
+
+@dataclass
+class FixDecision:
+    vuln:               Vulnerability
+    tier:               FixTier
+    safe_version:       Optional[str]
+    use_exclusion:      bool
+    exclusion_targets:  list[str]
+    bom_managed:        bool
+    patch_property:     Optional[str]
+    confidence:         float
+    reason:             str
+```
+
+-----
+
+## 13  Public API  (functions the existing pipeline calls)
+
+```python
+# Called by Fix Resolution phase
+process_all_vulnerabilities(vulns, pom_path) -> tuple[list, list, list]
+
+# Called by Maven build step on build failure
+bisect_rollback(decisions, pom_path) -> list[FixDecision]
+
+# Called by KB stage step
+get_kb_feedback(fixed, skipped) -> dict
+
+# Called by Commit & Push step
+generate_commit_message(fixed, skipped, suppressed) -> str
+```
+
+-----
+
+## 14  Environment Variables
+
+Read credentials from environment variables.
+**Fill in the names that match your environment before sending this prompt:**
+
+```python
+import os
+
+NEXUSIQ_BASE_URL   = os.environ['[YOUR_NEXUSIQ_BASE_URL_ENV_VAR]']
+NEXUSIQ_AUTH_TOKEN = os.environ['[YOUR_NEXUSIQ_AUTH_TOKEN_ENV_VAR]']
+```
+
+-----
+
+## 15  Pipeline Integration Map
+
+Include this comment block at the top of the generated file to show exactly
+where the script fits into the existing pipeline:
+
+```python
+# ═══════════════════════════════════════════════════════════════════
+# nexus_auto_fix.py — Fix Resolution Phase Only
+#
+# PIPELINE POSITION:
+#   Entry Mode Selection         ← already done by existing scripts
+#   ACS_MODE / KB init           ← already done
+#   PDF/YAML parse + repo clone  ← already done
+#   ACS-only fix pass            ← already done
+#   ─────────────────────────────────────────────────────────────────
+#   >>> THIS SCRIPT RUNS HERE <<<
+#   Fix Resolution (5-Tier Chain)
+#   ─────────────────────────────────────────────────────────────────
+#   Spring BOM special-case      ← handled inside this script
+#   Apply fixes (atomic write)   ← handled inside this script
+#   Conflict resolution          ← handled inside this script
+#   ─────────────────────────────────────────────────────────────────
+#   Ownership & context          ← already done by existing scripts
+#   Maven build + smoke test     ← already done (calls bisect_rollback
+#                                   on failure)
+#   NexusIQ CLI scan gate        ← already integrated, not duplicated
+#   Commit & push                ← uses generate_commit_message()
+#   KB stage                     ← uses get_kb_feedback()
+#   Post-push ADO / Tekton       ← already done
+# ═══════════════════════════════════════════════════════════════════
+```
+
+-----
+
+## 16  Final Instruction
+
+> Generate the complete `nexus_auto_fix.py` now.
+> Every function listed above must be **fully implemented** with real logic.
+> Do not produce placeholders, stubs, or TODO comments.
+> The script must be drop-in ready for the existing pipeline described above.
+
+-----
+
+-----
+
+*Remember: replace the two `[ ]` placeholders in Section 14 before sending.*
