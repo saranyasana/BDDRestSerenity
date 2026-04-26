@@ -1,0 +1,20 @@
+LOOP STRUCTURE:
+  Type: for loop / while loop / recursive call
+  MAX_ITERATIONS variable declared at: ___________
+  Loop body is inside: one function / split across functions
+
+STATE BETWEEN ITERATIONS:
+  attempted_artifacts  → declared at: ___ / reset each iter: yes/no
+  all_decisions_ever   → declared at: ___ / reset each iter: yes/no
+  fresh_vulns          → declared at: ___ / reset each iter: yes/no
+  pom_path             → declared at: ___ / stays same all iters: yes/no
+  collision history    → declared at: ___ / reset each iter: yes/no
+
+COLLISION CHECK RECEIVES:
+  current iteration decisions: yes/no
+  all previous decisions:       yes/no
+  just last iteration:          yes/no
+
+BOM STATE:
+  bom_managed flag carried on FixDecision: yes/no
+  patch_property field carried through Tier 3: yes/no
