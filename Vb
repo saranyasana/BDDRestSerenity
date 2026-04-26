@@ -1,41 +1,62 @@
-# VUIAutomation — Session Isolation Fix (Archive Edition)
-## VSCode Agent · GPT-4.1 · nexusiq_auto_vuln_fix.sh only
+# VUIAutomation — Complete Autonomous Fix Prompt
+## VSCode Agent · GPT-4.1 · Full Intelligence Mode
 ### Paste this entire file as your agent prompt. Do not modify it.
 
 ---
 
-## THE PROBLEM — READ THIS FIRST
+## WHAT YOU KNOW — CODEBASE FACTS (do not re-discover these)
 
 ```
-This pipeline runs against a SELECTED SET of repos each session.
-100+ repos exist. Each session picks a different subset.
+ORCHESTRATOR   : nexusiq_auto_vuln_fix.sh
+PYTHON ENGINE  : nexus_auto_fix.py
+ACS SCRIPT     : source_and_apply_acs_fixes.sh
+LOOP TYPE      : while loop in shell (ADO tag-based, not counter-based)
+                 10 iterations = fix → push → wait for ADO tag →
+                 get fresh NexusIQ report → fix again
+                 NOT a simple counter loop
 
-The previous fix added new state files without session scoping:
-  all_decisions_history.json
-  rolled_back_fixes.txt
+DIRECTORY STRUCTURE (per repo, under work/vuln_fix/<repo>/):
+  pom.xml                        ← Maven project file to patch
+  vulns.json                     ← vulnerabilities from NexusIQ
+  fix_results.json               ← results of this iteration's fixes
+  attempted_artifacts.txt        ← track what was tried
+  collision_state.txt            ← collision history
+  all_decisions_history.json     ← cumulative fix history
+  latest_report.pdf              ← NexusIQ report for this repo
+  archive/                       ← archived state from previous sessions
+  logs_YYYYMMDD_HHMMSS/          ← per-run debug logs
 
-These files are written to a flat $WORK_DIR path with no
-session identifier. When a new session starts with different
-repos, it reads the old state files and operates on the
-repos from the PREVIOUS session — not the current selection.
+ACS FILES:
+  acs_fix/acs_fixes.tsv
+  acs_fix/acs_pom_fixes.txt
+  acs_fix/resolved/<repo>/acs_pom_fixes.resolved.txt
 
-THE FIX:
-  1. Find how existing state files are already scoped per session
-  2. Apply the exact same scoping to the two new files
-  3. Instead of deleting old state files at session start —
-     ARCHIVE them to a dated subfolder so they are preserved
-     for audit and debugging
-  Nothing else changes.
-```
+OUTPUT:
+  output/nexusiq_reports/<repo>_build_<hash>.pdf
 
----
+ITERATION MEANING (critical — do not confuse with a counter loop):
+  One iteration = fix POM → build → push → wait for ADO tag creation
+                  → ADO tag created = NexusIQ scan completed
+                  → download fresh report → start next iteration
+  Each iteration is a FULL CYCLE including ADO pipeline execution.
+  State must be completely isolated per session (per repo selection).
+  KB is the ONLY data that carries across sessions.
 
-## ARCHITECTURE REMINDER
+SESSION ISOLATION RULE:
+  100+ repos exist. Each run selects a different subset.
+  Every state file is session-scoped EXCEPT kb.json.
+  Old session data must NEVER influence a new session.
+  Old state files must be ARCHIVED (not deleted) at session start.
+  Archive destination: work/vuln_fix/<repo>/archive/session_<TIMESTAMP>/
 
-```
-Bundle/unbundle pipeline — all paths come from export.txt.
-Every path variable MUST be declared after export.txt is read.
-Do not move, edit, or touch export.txt or the line that reads it.
+KB RULE (highest priority):
+  kb.json is the cross-session knowledge base.
+  If kb.json has a fix for a GA:
+    → Use it directly. Skip ALL tier chain logic.
+    → Attempt build immediately.
+    → If build passes → push → wait for ADO tag → verify NexusIQ.
+    → If build fails → do NOT remove from KB. Flag as needs-review.
+  KB fix has confidence 0.99 — treat it as ground truth.
 ```
 
 ---
@@ -43,276 +64,828 @@ Do not move, edit, or touch export.txt or the line that reads it.
 ## OPERATING CONTRACT
 
 ```
-FILE YOU MAY EDIT    : nexusiq_auto_vuln_fix.sh ONLY
-EVERYTHING ELSE      : DO NOT TOUCH
-SCOPE OF THIS FIX    : Session isolation + archive for two new state
-                       files only. Nothing else. No other changes.
+FILES YOU MAY EDIT:
+  nexusiq_auto_vuln_fix.sh
+  nexus_auto_fix.py
+  source_and_apply_acs_fixes.sh   (only if ACS gap fix requires it)
+
+FILES YOU MUST NOT TOUCH:
+  export.txt
+  machine_paths.env
+  extract_nexus_mufg_m...sh
+  repo_runtime_selector...py
+  automation_ui.py / build_pyc_dist.py / bundle_scripts.py
+  convert_artifacts_to_excel.py
+  deployment_status_202...py (all variants)
+  export_project.py / setup.py
+  Any file in /tools /Veracode /work (except vuln_fix state files)
+
+ARCHITECTURE RULES:
+  □ All path variables declared AFTER export.txt / machine_paths.env is read
+  □ Bundle/unbundle: script runs from extracted runtime location
+  □ Paths come from export.txt — never hardcode a path
+  □ Quote EVERY $VARIABLE used in a file path (spaces in OneDrive path)
+  □ mkdir -p before every cp or mv to a new directory
+  □ One change at a time — re-read surrounding code between changes
+  □ Do not reformat, rename, or lint anything not in direct fix scope
 ```
 
 ---
 
-## PHASE 1 — FIND THESE THINGS FIRST
+## PHASE 1 — READ AND UNDERSTAND FIRST
 
-Do not edit anything until you have found and reported all of these.
+Before any edit, read these files completely and answer internally:
 
 ```
-FIND AND REPORT:
+READ nexusiq_auto_vuln_fix.sh:
+  Q1.  Where is export.txt / machine_paths.env read?        LINE: ___
+  Q2.  Where is $WORK_DIR / $WORKDIR first assigned?        LINE: ___
+  Q3.  Where does the while loop start?                     LINE: ___
+  Q4.  How is ADO tag creation detected?                    LINE: ___
+  Q5.  Where is the NexusIQ report downloaded after tag?    LINE: ___
+  Q6.  Where is kb.json read?  Does it exist?               LINE: ___
+  Q7.  How are session state files currently scoped?        PATTERN: ___
+  Q8.  Where is attempted_artifacts.txt written?            LINE: ___
+  Q9.  Where is all_decisions_history.json written?         LINE: ___
+  Q10. Is there an existing archive step?                   YES/NO: ___
+  Q11. Where does Maven build run?                          LINE: ___
+  Q12. How is Maven build success/failure detected?         PATTERN: ___
+  Q13. Where is the Tekton pipeline triggered?              LINE: ___
+  Q14. Is compilation error checking separate from
+       Maven exit code checking?                            YES/NO: ___
 
-  □ How attempted_artifacts.txt is named/pathed
-    → Does it include a session ID, timestamp, or run ID?
-    → What is the exact variable or expression used?
-    → LINE: ___   PATTERN: ___
-
-  □ How collision_state.txt is named/pathed
-    → Same question — what scoping does it use?
-    → LINE: ___   PATTERN: ___
-
-  □ Where SESSION_ID / RUN_ID / TIMESTAMP is declared
-    → What is the variable name your script uses?
-    → LINE: ___   VARIABLE NAME: ___
-
-  □ Where HISTORY_FILE is declared
-    → Is it using the same session scoping as attempted_artifacts?
-    → LINE: ___   CURRENTLY SCOPED: yes / no
-
-  □ Where ROLLBACK_FILE is declared
-    → Is it using the same session scoping?
-    → LINE: ___   CURRENTLY SCOPED: yes / no
-
-  □ Whether the script has an existing cleanup/reset block
-    at session start that touches any state files
-    → EXISTS: yes / no
-    → If yes: LINE: ___  WHAT IT DOES: ___
-
-  □ Where the archive/logs directory is for this pipeline
-    → What variable holds the log/archive directory path?
-    → LINE: ___   VARIABLE NAME: ___
+READ nexus_auto_fix.py:
+  Q15. Where is the tier resolution chain entry point?      LINE: ___
+  Q16. Where is KB lookup performed?                        LINE: ___
+  Q17. Does KB lookup short-circuit the tier chain?         YES/NO: ___
+  Q18. Where is BOM detection performed?                    LINE: ___
+  Q19. Does Tier 3 check bom_managed before writing?        YES/NO: ___
+  Q20. Where is collision_check() defined?                  LINE: ___
+  Q21. What does collision_check receive as input?          PARAMS: ___
+  Q22. Does it receive all_decisions_history or only
+       current iteration?                                   ANSWER: ___
+  Q23. Where is pom.xml written after fixes?                LINE: ___
+  Q24. Is ET.register_namespace called before write?        YES/NO: ___
+  Q25. Is there a dry-run parse before file write?          YES/NO: ___
+  Q26. Where is vulns filtered for iteration 2+?            LINE/NO: ___
+  Q27. What happens when zero fixes are found?              ANSWER: ___
+  Q28. Is there a "fix best combination" fallback?          YES/NO: ___
 ```
 
-**Report all findings. Then proceed to Phase 2.**
+**Do not edit anything until all questions are answered internally.**
 
 ---
 
-## PHASE 2 — SCOPE THE TWO NEW FILES
+## GAP 1 — KB IS NOT SHORT-CIRCUITING THE TIER CHAIN
 
-After Phase 1, you know exactly how `attempted_artifacts.txt`
-and `collision_state.txt` are scoped per session.
+### What is wrong
+KB lookup exists but does not bypass the full tier resolution chain.
+When KB has a fix, the tool still runs NexusIQ API, Maven Central scan,
+and collision check — wasting time and risking override of a known-good fix.
 
-Apply the EXACT SAME scoping pattern to `HISTORY_FILE`
-and `ROLLBACK_FILE`. Nothing else.
+### Fix in nexus_auto_fix.py
 
-```bash
-# EXAMPLE ONLY — your actual pattern will differ.
-# Match whatever pattern attempted_artifacts.txt uses.
+Find the tier resolution entry point. Add KB short-circuit at the very top:
 
-# If attempted_artifacts.txt uses a session timestamp:
-ATTEMPTED_FILE="$WORK_DIR/${SESSION_ID}_attempted_artifacts.txt"
-# Then:
-HISTORY_FILE="$WORK_DIR/${SESSION_ID}_all_decisions_history.json"
-ROLLBACK_FILE="$WORK_DIR/${SESSION_ID}_rolled_back_fixes.txt"
+```python
+def resolve_fix_for_vuln(vuln, triage, pom_path,
+                          kb_path=None, rollback_file=None):
 
-# If attempted_artifacts.txt uses a run directory:
-ATTEMPTED_FILE="$RUN_DIR/attempted_artifacts.txt"
-# Then:
-HISTORY_FILE="$RUN_DIR/all_decisions_history.json"
-ROLLBACK_FILE="$RUN_DIR/rolled_back_fixes.txt"
+    ga = f"{vuln.group_id}:{vuln.artifact_id}"
 
-# If attempted_artifacts.txt uses a repo hash:
-ATTEMPTED_FILE="$WORK_DIR/${REPO_HASH}_attempted_artifacts.txt"
-# Then:
-HISTORY_FILE="$WORK_DIR/${REPO_HASH}_all_decisions_history.json"
-ROLLBACK_FILE="$WORK_DIR/${REPO_HASH}_rolled_back_fixes.txt"
+    # ── KB SHORT-CIRCUIT (highest priority) ─────────────────────
+    if kb_path and os.path.exists(kb_path):
+        kb_fix = kb_lookup(ga, vuln.current_version, vuln.cve_ids, kb_path)
+        if kb_fix:
+            return FixDecision(
+                vuln           = vuln,
+                tier           = FixTier.KB_EXACT,
+                safe_version   = kb_fix["safe_version"],
+                bom_managed    = triage.get("bom_managed", False),
+                patch_property = triage.get("prop_key"),
+                use_exclusion  = False,
+                exclusion_targets = [],
+                confidence     = 0.99,
+                reason         = f"KB exact match: {kb_fix['safe_version']}"
+            )
+    # ── END KB SHORT-CIRCUIT ─────────────────────────────────────
+
+    # Tier 2+ chain continues below only if KB had no match
+    ...existing tier chain...
 ```
 
-**Use whatever pattern the existing files use. Do not invent a new one.**
+### Fix in nexusiq_auto_vuln_fix.sh
+
+After KB fixes are applied and build passes, update KB with confirmed fixes:
+
+```bash
+# After successful build + push, add to KB:
+python3 -c "
+import json, os
+kb_path = os.environ['KB_PATH']
+results_path = os.environ['FIX_RESULTS_FILE']
+
+kb = json.load(open(kb_path)) if os.path.exists(kb_path) else {}
+results = json.load(open(results_path))
+fixed = results.get('fixed', results) if isinstance(results, dict) else results
+
+for fix in (fixed if isinstance(fixed, list) else []):
+    ga = fix.get('group_id','') + ':' + fix.get('artifact_id','')
+    if ga:
+        kb[ga] = {
+            'safe_version': fix.get('safe_version'),
+            'tier':         fix.get('tier'),
+            'cve_ids':      fix.get('cve_ids', []),
+            'build_validated': True,
+            'nexusiq_verified': False   # set to True after ADO tag confirms clean
+        }
+
+with open(kb_path, 'w') as f:
+    json.dump(kb, f, indent=2)
+"
+```
+
+After ADO tag confirms NexusIQ clean scan, mark as verified:
+
+```bash
+# After clean NexusIQ report confirmed:
+python3 -c "
+import json, os
+kb_path = os.environ['KB_PATH']
+kb = json.load(open(kb_path)) if os.path.exists(kb_path) else {}
+for ga, entry in kb.items():
+    if entry.get('build_validated') and not entry.get('nexusiq_verified'):
+        entry['nexusiq_verified'] = True
+with open(kb_path, 'w') as f:
+    json.dump(kb, f, indent=2)
+"
+```
 
 ---
 
-## PHASE 3 — ARCHIVE INSTEAD OF DELETE
+## GAP 2 — MAVEN BUILD PASSES IN TOOL BUT FAILS IN TEKTON (compilation errors)
 
-This is the critical change from any previous prompt version.
-**Do NOT delete state files. Archive them.**
+### What is wrong
+The shell script checks Maven exit code only (`$? -eq 0`).
+Maven can exit 0 with compilation errors in certain multi-module setups
+where one module fails but the build is not set to fail-fast.
+Tekton runs the full build with stricter settings and catches what the tool misses.
 
-### 3.1  Find the existing cleanup block
+### Fix in nexusiq_auto_vuln_fix.sh
 
-If the script has an existing block that cleans up state files
-at session start (found in Phase 1), it likely looks like:
-
-```bash
-# Existing pattern — may use rm, unset, or truncate:
-rm -f "$ATTEMPTED_FILE"
-rm -f "$COLLISION_STATE_FILE"
-# OR
-> "$ATTEMPTED_FILE"    # truncate
-```
-
-### 3.2  Replace delete with archive in that block
-
-**Do NOT delete. Move to an archive folder instead.**
+Replace the simple exit code check with a full output scan:
 
 ```bash
-# ARCHIVE HELPER — add this function once, near other helper
-# functions in the script. Do not add it inside a loop.
+# Find the Maven build invocation. It will look like:
+mvn package -f "$REPO_DIR/pom.xml" ... > "$BUILD_LOG" 2>&1
+BUILD_EXIT=$?
 
-archive_state_file() {
-    local file_path="$1"
-    local archive_base="$2"    # the archive root directory
+# REPLACE the success check with:
+build_truly_passed() {
+    local log="$1"
+    local exit_code="$2"
 
-    # Only archive if the file actually exists and is non-empty
-    if [ ! -f "$file_path" ] || [ ! -s "$file_path" ]; then
-        return 0
+    # Exit code must be 0
+    if [ "$exit_code" -ne 0 ]; then
+        return 1
     fi
 
-    # Build archive subdirectory using timestamp of the file
-    # so each session's archive is clearly separated
-    local file_timestamp
-    file_timestamp=$(python3 -c "
-import os, datetime
-t = os.path.getmtime('$file_path')
-print(datetime.datetime.fromtimestamp(t).strftime('%Y%m%d_%H%M%S'))
-" 2>/dev/null || date '+%Y%m%d_%H%M%S')
+    # Even if exit 0, scan log for compilation failures
+    if grep -qiE \
+        "BUILD FAILURE|COMPILATION ERROR|cannot find symbol|\
+        error: package .* does not exist|error: cannot access|\
+        ClassNotFoundException|NoClassDefFoundError|\
+        symbol not found|incompatible types" \
+        "$log" 2>/dev/null; then
+        log "[BUILD] Exit code 0 but compilation errors detected in log."
+        log "[BUILD] This fix would fail in Tekton. Treating as build failure."
+        return 1
+    fi
 
-    local archive_dir="$archive_base/session_${file_timestamp}"
-    mkdir -p "$archive_dir"
+    # Must contain explicit BUILD SUCCESS
+    if ! grep -q "BUILD SUCCESS" "$log" 2>/dev/null; then
+        log "[BUILD] Exit code 0 but BUILD SUCCESS not found. Treating as failure."
+        return 1
+    fi
 
-    # Move the file — preserves content, frees the path for new session
-    mv "$file_path" "$archive_dir/$(basename "$file_path")"
-    log "[ARCHIVE] $(basename "$file_path") → $archive_dir"
+    return 0
 }
+
+if build_truly_passed "$BUILD_LOG" "$BUILD_EXIT"; then
+    log "[BUILD] Verified: BUILD SUCCESS with no compilation errors."
+    # proceed to push
+else
+    log "[BUILD] Build failed or has compilation errors. Rolling back POM."
+    cp "$REPO_DIR/pom.xml.bak" "$REPO_DIR/pom.xml"
+    # record rollback
+    echo "$ga:$safe_version" >> "$ROLLBACK_FILE"
+fi
 ```
 
-### 3.3  Replace the cleanup block calls
-
-Find where state files are cleaned at session start.
-Replace every `rm -f "$STATE_FILE"` with `archive_state_file`:
+Also add Maven flags to make it behave consistently with Tekton:
 
 ```bash
-# BEFORE (delete):
-rm -f "$ATTEMPTED_FILE"
-rm -f "$COLLISION_STATE_FILE"
-
-# AFTER (archive):
-ARCHIVE_DIR="$LOG_DIR/state_archive"   # use your existing log directory variable
-archive_state_file "$ATTEMPTED_FILE"      "$ARCHIVE_DIR"
-archive_state_file "$COLLISION_STATE_FILE" "$ARCHIVE_DIR"
-```
-
-### 3.4  Add HISTORY_FILE and ROLLBACK_FILE to the same archive block
-
-```bash
-# ADD alongside the existing files in the same block:
-archive_state_file "$HISTORY_FILE"   "$ARCHIVE_DIR"
-archive_state_file "$ROLLBACK_FILE"  "$ARCHIVE_DIR"
-```
-
-### 3.5  If NO cleanup block exists
-
-If Phase 1 found no existing cleanup block:
-
-```bash
-# ADD a new archive block immediately AFTER export.txt is read
-# and AFTER all path variables are declared
-# and BEFORE the while loop starts:
-
-ARCHIVE_DIR="$LOG_DIR/state_archive"   # use your log dir variable
-mkdir -p "$ARCHIVE_DIR"
-
-# Archive any leftover state from a previous session
-archive_state_file "$ATTEMPTED_FILE"       "$ARCHIVE_DIR"
-archive_state_file "$COLLISION_STATE_FILE" "$ARCHIVE_DIR"
-archive_state_file "$HISTORY_FILE"         "$ARCHIVE_DIR"
-archive_state_file "$ROLLBACK_FILE"        "$ARCHIVE_DIR"
+# Find the mvn command and add these flags if not already present:
+MVN_FLAGS="-B --fail-at-end -Dmaven.test.skip=false"
+# -B          = batch mode (no interactive, same as Tekton)
+# --fail-at-end = catch all module failures, not just first
+# Do not skip tests — Tekton doesn't skip them
 ```
 
 ---
 
-## PHASE 4 — VERIFY ARCHIVE FOLDER VARIABLE
+## GAP 3 — ZERO FIXES = SKIP, SHOULD BE = FIX BEST COMBINATION
 
-The archive function uses `$LOG_DIR` (or your equivalent log directory
-variable). Verify:
+### What is wrong
+When no individual fix passes all checks, the tool applies nothing.
+It should instead find the best safe combination — fix what can be fixed
+even if some vulnerabilities remain.
 
+### Fix in nexus_auto_fix.py
+
+Find where the fix loop exits when `decisions` is empty or all skipped.
+Add a combination fallback:
+
+```python
+def find_best_fixable_combination(vulns, triage_map, pom_path,
+                                   attempted_artifacts, kb_path):
+    """
+    When normal resolution produces zero apply-able fixes:
+    1. Try each vuln independently with relaxed collision rules
+    2. Pick the subset that can all be applied without conflicting
+    3. Apply that subset — partial fix is always better than no fix
+    4. Never apply a fix that was previously rolled back
+    """
+    candidates = []
+
+    for vuln in vulns:
+        ga = f"{vuln.group_id}:{vuln.artifact_id}"
+        triage = triage_map.get(ga, {})
+
+        # Try every tier independently
+        for tier_fn in [try_kb, try_nexusiq, try_maven_central,
+                        try_exclusion]:
+            decision = tier_fn(vuln, triage, pom_path, kb_path)
+            if decision and decision.safe_version:
+                candidates.append(decision)
+                break   # take first successful tier for this vuln
+
+    if not candidates:
+        return []
+
+    # Remove conflicts: same GA targeted at different versions
+    # Keep higher semver winner
+    clean = {}
+    for d in candidates:
+        ga = f"{d.vuln.group_id}:{d.vuln.artifact_id}"
+        if ga not in clean:
+            clean[ga] = d
+        else:
+            existing = safe_version_parse(clean[ga].safe_version)
+            current  = safe_version_parse(d.safe_version)
+            if current and existing and current > existing:
+                clean[ga] = d
+
+    return list(clean.values())
+
+
+# In process_all_vulnerabilities(), after normal resolution:
+if not apply_list:
+    log.info("Normal resolution produced zero fixes. "
+             "Attempting best-combination fallback.")
+    apply_list = find_best_fixable_combination(
+        remaining_vulns, triage_map, pom_path,
+        attempted_artifacts, kb_path
+    )
+    if apply_list:
+        log.info(f"Best-combination fallback found "
+                 f"{len(apply_list)} fixable vulnerabilities.")
+    else:
+        log.info("No fixable combination found. Converged.")
 ```
-  □ What is the actual variable name for your log/output directory?
-    (seen in logs as: .../VUIAutomation/work/vuln_fix/logs_20260426_...)
-    It may be LOG_DIR, LOGS_DIR, OUTPUT_DIR, or similar.
-
-  □ Is it declared after export.txt is read? (it must be)
-
-  □ Use that exact variable name in ARCHIVE_DIR — do not hardcode a path.
-```
-
-If the log directory variable is `LOGS_DIR` not `LOG_DIR`, use `$LOGS_DIR`.
-If it is `OUTPUT_DIR`, use `$OUTPUT_DIR`. Match exactly what exists.
 
 ---
 
-## WHAT THE ARCHIVE STRUCTURE WILL LOOK LIKE
+## GAP 4 — SESSION ISOLATION: OLD STATE BLEEDS INTO NEW SESSION
 
-After this fix, previous session state is preserved like this:
+### What is wrong
+State files from previous sessions (different repo selection) are read
+by the new session. KB is the ONLY file allowed to persist across sessions.
+All other state must be archived and fresh files started.
 
+### Fix in nexusiq_auto_vuln_fix.sh
+
+Find where session scoping variables are declared (after export.txt read).
+Add archive function and session-start archive call:
+
+```bash
+# ADD this function once, near other helper functions (not inside a loop):
+archive_session_state() {
+    local repo_dir="$1"
+    local timestamp
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    local archive_dir="$repo_dir/archive/session_${timestamp}"
+
+    local files_archived=0
+    for state_file in \
+        "$repo_dir/attempted_artifacts.txt" \
+        "$repo_dir/collision_state.txt" \
+        "$repo_dir/all_decisions_history.json" \
+        "$repo_dir/fix_results.json" \
+        "$repo_dir/rolled_back_fixes.txt"
+    do
+        if [ -f "$state_file" ] && [ -s "$state_file" ]; then
+            mkdir -p "$archive_dir"
+            mv "$state_file" "$archive_dir/$(basename "$state_file")"
+            files_archived=$((files_archived + 1))
+        fi
+    done
+
+    if [ "$files_archived" -gt 0 ]; then
+        log "[ARCHIVE] $files_archived state files archived → $archive_dir"
+    fi
+    # kb.json is NOT in this list — it is never archived, always kept
+}
+
+# ADD call at the start of each repo's processing (inside the for repo loop,
+# BEFORE pom.xml is restored from backup and BEFORE state files are loaded):
+archive_session_state "$REPO_WORK_DIR"
 ```
-$LOG_DIR/
-  state_archive/
-    session_20260425_142233/        ← yesterday's session
-      attempted_artifacts.txt
-      collision_state.txt
-      all_decisions_history.json
-      rolled_back_fixes.txt
-    session_20260426_091045/        ← this morning's session
-      attempted_artifacts.txt
-      collision_state.txt
-      all_decisions_history.json
-      rolled_back_fixes.txt
+
+---
+
+## GAP 5 — NEXUSIQ VERIFICATION AFTER PUSH NOT CONFIRMING FIX
+
+### What is wrong
+After ADO tag is created and fresh NexusIQ report downloaded,
+the tool does not explicitly check whether the vulnerabilities
+that were fixed in this iteration are gone from the new report.
+It just starts the next iteration without confirming the fixes worked.
+
+### Fix in nexusiq_auto_vuln_fix.sh
+
+After downloading the fresh report and converting to vulns.json,
+add a verification step before starting the next iteration:
+
+```bash
+verify_fixes_reflected_in_new_report() {
+    local prev_fixed_file="$1"    # fix_results.json from last iteration
+    local new_vulns_file="$2"     # fresh vulns.json after ADO tag
+    local repo="$3"
+
+    python3 - <<EOF
+import json, os, sys
+
+prev_path = "$prev_fixed_file"
+new_path  = "$new_vulns_file"
+
+if not os.path.exists(prev_path) or not os.path.exists(new_path):
+    sys.exit(0)
+
+prev = json.load(open(prev_path))
+fixed = prev.get('fixed', prev) if isinstance(prev, dict) else prev
+if not isinstance(fixed, list):
+    sys.exit(0)
+
+new_vulns = json.load(open(new_path))
+new_gas = {
+    v.get('group_id','') + ':' + v.get('artifact_id','')
+    for v in (new_vulns if isinstance(new_vulns, list) else [])
+}
+
+still_present = []
+confirmed_fixed = []
+
+for fix in fixed:
+    ga = fix.get('group_id','') + ':' + fix.get('artifact_id','')
+    if ga in new_gas:
+        still_present.append(ga)
+    else:
+        confirmed_fixed.append(ga)
+
+print(f"[VERIFY] Confirmed fixed in NexusIQ: {len(confirmed_fixed)}")
+print(f"[VERIFY] Still present in new report: {len(still_present)}")
+
+if still_present:
+    print(f"[VERIFY] Still vulnerable (may need next iteration): "
+          f"{', '.join(still_present[:5])}")
+
+# Write verification result
+result = {
+    'confirmed_fixed': confirmed_fixed,
+    'still_present':   still_present,
+    'repo':            '$repo'
+}
+out = os.path.join(os.path.dirname(new_path), 'verify_results.json')
+json.dump(result, open(out, 'w'), indent=2)
+EOF
+}
+
+# Call after fresh vulns.json is written, before next iteration starts:
+verify_fixes_reflected_in_new_report \
+    "$REPO_WORK_DIR/fix_results.json" \
+    "$REPO_WORK_DIR/vulns.json" \
+    "$REPO_NAME"
 ```
 
-Each session gets its own subfolder named by the timestamp of the
-state files from that session. Nothing is ever deleted.
-New session starts with clean state files at their scoped paths.
+Also update KB after verification:
+
+```bash
+# After verify_results.json written, mark confirmed fixes in KB:
+python3 -c "
+import json, os
+kb_path    = os.environ.get('KB_PATH','')
+verify_path = '$REPO_WORK_DIR/verify_results.json'
+if not kb_path or not os.path.exists(verify_path):
+    exit()
+kb = json.load(open(kb_path)) if os.path.exists(kb_path) else {}
+v  = json.load(open(verify_path))
+for ga in v.get('confirmed_fixed', []):
+    if ga in kb:
+        kb[ga]['nexusiq_verified'] = True
+with open(kb_path, 'w') as f:
+    json.dump(kb, f, indent=2)
+"
+```
+
+---
+
+## GAP 6 — COLLISION CHECK ONLY SEES CURRENT ITERATION
+
+### What is wrong
+`collision_check()` in `nexus_auto_fix.py` receives only current
+iteration decisions. History from earlier iterations is invisible,
+causing false "unique" classifications and re-attempting dead fixes.
+
+### Fix in nexus_auto_fix.py
+
+```python
+# Find collision_check() signature. Add history parameter:
+def collision_check(current_decisions, collision_state,
+                    history_path=None):   # default keeps existing calls working
+
+    all_previous = []
+    if history_path and os.path.exists(history_path):
+        try:
+            with open(history_path) as f:
+                all_previous = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            all_previous = []
+
+    previous_map = {}
+    for d in all_previous:
+        ga = f"{d.get('group_id','')}:{d.get('artifact_id','')}"
+        if ga:
+            previous_map[ga] = {
+                'safe_version': d.get('safe_version'),
+                'tier':         int(d.get('tier', 99))
+            }
+
+    apply_list     = []
+    collision_list = []
+
+    for d in current_decisions:
+        ga   = f"{d.vuln.group_id}:{d.vuln.artifact_id}"
+        prev = previous_map.get(ga)
+
+        if prev is None:
+            apply_list.append(d)
+        elif d.safe_version == prev['safe_version']:
+            pass   # idempotent — skip silently, NOT a collision
+        elif d.tier.value < prev['tier']:
+            apply_list.append(d)   # better tier — retry
+        else:
+            collision_list.append(d)   # true collision
+
+    # Three-way routing:
+    # apply_list non-empty               → proceed to apply
+    # apply_list empty + collision_list  → manual review
+    # both empty                         → converged
+    return apply_list, collision_list
+```
+
+Pass history_path from shell when calling nexus_auto_fix.py:
+
+```bash
+# Find where nexus_auto_fix.py is called with collision mode.
+# Add --history argument (existing args unchanged):
+python3 nexus_auto_fix.py \
+    --history "$REPO_WORK_DIR/all_decisions_history.json" \
+    ... # all existing args exactly as they are
+```
+
+---
+
+## GAP 7 — POM RE-DIFF NOT DONE BEFORE ITERATION 2+
+
+### What is wrong
+In iteration 2+, `vulns.json` is fresh but the tool re-attempts artifacts
+the POM already has patched from iteration 1, producing zero new decisions.
+
+### Fix in nexus_auto_fix.py
+
+```python
+def filter_already_patched_vulns(vulns, pom_path, iteration_num):
+    """
+    Call only when iteration_num > 1.
+    Removes vulns whose artifact is already at a different version
+    in the current on-disk POM (meaning a previous iteration fixed it).
+    Keeps transitives (no direct POM entry to diff against).
+    """
+    if iteration_num <= 1:
+        return vulns
+
+    try:
+        tree = ET.parse(pom_path)
+        root = tree.getroot()
+        ns   = detect_namespace(root)
+    except ET.ParseError:
+        return vulns    # unreadable POM — pass all, fail safely
+
+    current = {}
+    for dep in root.findall(f".//{ns}dependency"):
+        g = dep.findtext(f"{ns}groupId",    "").strip()
+        a = dep.findtext(f"{ns}artifactId", "").strip()
+        v = dep.findtext(f"{ns}version",    "").strip()
+        if g and a and v:
+            current[f"{g}:{a}"] = v
+
+    remaining = []
+    for vuln in vulns:
+        ga  = f"{vuln.group_id}:{vuln.artifact_id}"
+        ver = current.get(ga)
+        if ver is None:
+            remaining.append(vuln)   # transitive — keep
+        elif ver == vuln.current_version:
+            remaining.append(vuln)   # still vulnerable — keep
+        # else: already patched — skip
+
+    return remaining
+```
+
+Pass iteration number from shell:
+
+```bash
+# Find where nexus_auto_fix.py is called. Add --iteration:
+python3 nexus_auto_fix.py \
+    --iteration "$CURRENT_ITERATION" \
+    ... # all existing args unchanged
+```
+
+---
+
+## GAP 8 — BOM TIER 3 WRITES DIRECT PIN INSTEAD OF PROPERTY
+
+### What is wrong
+When Tier 1 and Tier 2 fail for a BOM-managed artifact, Tier 3 finds
+a safe version and writes it as a direct `<dependency>` version.
+Maven ignores it because the BOM controls that artifact's version.
+The fix appears applied but has zero effect.
+
+### Fix in nexus_auto_fix.py
+
+Find the Tier 3 return statement. Add BOM intercept immediately before it:
+
+```python
+# In Tier 3 resolution, BEFORE the return FixDecision:
+if safe_ver:
+    if triage.get("bom_managed") and triage.get("prop_key"):
+        # Translate artifact version to BOM property value
+        # For most BOMs (Spring, etc.) property value = artifact version
+        bom_prop_value = safe_ver
+        return FixDecision(
+            vuln           = vuln,
+            tier           = FixTier.MAVEN_SAFE_VER,
+            safe_version   = bom_prop_value,
+            bom_managed    = True,
+            patch_property = triage["prop_key"],
+            use_exclusion  = False,
+            exclusion_targets = [],
+            confidence     = 0.75,
+            reason         = (f"BOM property patch: "
+                              f"{triage['prop_key']}={bom_prop_value}")
+        )
+    # Non-BOM path — existing return unchanged below
+```
+
+Add major version safety guard before writing any BOM property:
+
+```python
+def is_bom_bump_safe(old_val, new_val):
+    old = safe_version_parse(old_val)
+    new = safe_version_parse(new_val)
+    if old and new and new.major > old.major:
+        return False   # major bump — flag for manual review
+    return True
+
+# In apply_property_patches(), before writing:
+if decision.bom_managed:
+    current_val = get_current_property_value(
+        decision.patch_property, root, ns)
+    if not is_bom_bump_safe(current_val, decision.safe_version):
+        suppressed.append(decision)
+        log.warning(
+            f"BOM major bump skipped — "
+            f"{decision.patch_property}: "
+            f"{current_val} → {decision.safe_version}. "
+            f"Manual review required."
+        )
+        continue
+```
+
+---
+
+## GAP 9 — XML NAMESPACE STRIPPED ON POM WRITE (runtime crash)
+
+### What is wrong
+`ElementTree` drops namespace declarations on write.
+Maven cannot parse a POM without the `xmlns` declaration.
+The build fails immediately with a confusing error.
+
+### Fix in nexus_auto_fix.py
+
+Find your POM write function. Add before every write:
+
+```python
+# ADD at start of POM write function:
+ET.register_namespace('', 'http://maven.apache.org/POM/4.0.0')
+ET.register_namespace(
+    'xsi', 'http://www.w3.org/2001/XMLSchema-instance')
+
+xml_string = ET.tostring(
+    root, encoding='unicode', xml_declaration=True)
+
+# Dry-run validate before touching the real file
+try:
+    ET.fromstring(xml_string)
+except ET.ParseError as e:
+    shutil.copy(f"{pom_path}.bak", pom_path)
+    raise RuntimeError(
+        f"POM write aborted — XML invalid after patch: {e}")
+
+with open(pom_path, 'w', encoding='utf-8') as f:
+    f.write(xml_string)
+```
+
+---
+
+## GAP 10 — SEMVER CRASH ON MAVEN VERSION STRINGS
+
+### What is wrong
+`packaging.version.Version()` throws `InvalidVersion` on strings like
+`1.0.0.Final`, `2.3.0.RELEASE`, `3.0-beta-1`, `5.0.0.M6`.
+Any repo using Spring or Hibernate versions crashes the fix engine entirely.
+
+### Fix in nexus_auto_fix.py
+
+Add this helper. Replace every `Version(x)` call with `safe_version_parse(x)`:
+
+```python
+def safe_version_parse(version_str):
+    from packaging.version import Version, InvalidVersion
+    import re
+    if not version_str:
+        return None
+    cleaned = (str(version_str)
+               .replace('.Final', '').replace('.RELEASE', '')
+               .replace('.GA',    '').replace('-SNAPSHOT', '')
+               .replace('.M',     '.dev').strip())
+    try:
+        return Version(cleaned)
+    except InvalidVersion:
+        numeric = re.match(r'[\d.]+', cleaned)
+        try:
+            return Version(numeric.group()) if numeric else None
+        except (InvalidVersion, AttributeError):
+            return None
+```
+
+---
+
+## GAP 11 — NEXUSIQ API NO RETRY (silent hang)
+
+### Fix in nexus_auto_fix.py
+
+Wrap all NexusIQ HTTP calls:
+
+```python
+def nexusiq_request(url, headers, timeout=30, max_attempts=3):
+    import time
+    for attempt in range(max_attempts):
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+            else:
+                return None
+        except requests.HTTPError:
+            return None
+    return None
+```
+
+---
+
+## GAP 12 — CONVERGENCE: 10 ADO ITERATIONS NOT WASTED ON NO-OPS
+
+### What is wrong
+The ADO tag loop runs all 10 full pipeline cycles even if zero fixes
+were applied in the last iteration — wasting ADO pipeline minutes
+and NexusIQ scan slots.
+
+### Fix in nexusiq_auto_vuln_fix.sh
+
+After `fix_results.json` is written and before waiting for ADO tag:
+
+```bash
+# Count fixes this iteration
+FIXES_THIS_ITER=$(python3 -c "
+import json, os
+f = os.environ.get('FIX_RESULTS_FILE','')
+if not f or not os.path.exists(f):
+    print(0); exit()
+try:
+    d = json.load(open(f))
+    r = d.get('fixed', d) if isinstance(d, dict) else d
+    print(len(r) if isinstance(r, list) else 0)
+except: print(0)
+" 2>/dev/null || echo 0)
+
+export FIX_RESULTS_FILE="$REPO_WORK_DIR/fix_results.json"
+
+if [ "${FIXES_THIS_ITER:-0}" -eq 0 ]; then
+    log "[CONVERGE] Zero fixes this iteration for $REPO_NAME."
+    log "[CONVERGE] Skipping push and ADO trigger. "
+    log "[CONVERGE] Remaining iterations released."
+    continue   # skip to next repo — do not trigger ADO
+fi
+
+# Only push and wait for ADO tag if fixes were actually applied
+```
 
 ---
 
 ## VERIFICATION CHECKLIST
 
 ```
-PHASE 1:
-  □ Session scoping pattern of attempted_artifacts.txt identified
-  □ Session scoping pattern of collision_state.txt identified
-  □ Both use same pattern (confirmed yes/no)
-  □ SESSION_ID / RUN_ID / equivalent variable name found
-  □ Log/archive directory variable name found
-  □ Existing cleanup block found or confirmed absent
+GAPS FIXED IN nexus_auto_fix.py:
+  □ Gap 1:  KB short-circuits tier chain — no further tiers attempted
+  □ Gap 3:  find_best_fixable_combination() added and called on zero-fix
+  □ Gap 6:  collision_check() receives history_path, three-way routing
+  □ Gap 7:  filter_already_patched_vulns() called when iteration > 1
+  □ Gap 8:  Tier 3 BOM intercept — property patch not direct pin
+  □ Gap 8:  BOM major version bump guard added
+  □ Gap 9:  ET.register_namespace() + dry-run parse before POM write
+  □ Gap 10: safe_version_parse() replaces all Version() calls
+  □ Gap 11: nexusiq_request() wrapper with 3x retry used for all calls
 
-PHASE 2:
-  □ HISTORY_FILE now uses exact same scoping as attempted_artifacts.txt
-  □ ROLLBACK_FILE now uses exact same scoping as attempted_artifacts.txt
-  □ Both still declared AFTER export.txt is read
-  □ No other variable declarations changed
+GAPS FIXED IN nexusiq_auto_vuln_fix.sh:
+  □ Gap 1:  KB updated after build pass + after NexusIQ verification
+  □ Gap 2:  build_truly_passed() checks log for compilation errors
+  □ Gap 2:  Maven -B --fail-at-end flags added
+  □ Gap 4:  archive_session_state() archives all state except kb.json
+  □ Gap 4:  Called per repo at session start
+  □ Gap 5:  verify_fixes_reflected_in_new_report() called after fresh scan
+  □ Gap 5:  KB nexusiq_verified flag set after confirmation
+  □ Gap 12: Zero-fix early exit — ADO not triggered unnecessarily
 
-PHASE 3:
-  □ archive_state_file() function added once (not inside a loop)
-  □ ARCHIVE_DIR uses existing log directory variable (not hardcoded)
-  □ If cleanup block existed:
-      - rm -f replaced with archive_state_file for existing files
-      - HISTORY_FILE and ROLLBACK_FILE added to same block
-  □ If no cleanup block existed:
-      - New archive block added after export.txt read, before while loop
-      - All four state files included
-  □ No state file is deleted anywhere — only moved via mv
+SESSION ISOLATION CONFIRMED:
+  □ kb.json: NOT archived — persists across all sessions
+  □ attempted_artifacts.txt: archived at session start
+  □ collision_state.txt: archived at session start
+  □ all_decisions_history.json: archived at session start
+  □ fix_results.json: archived at session start
+  □ rolled_back_fixes.txt: archived at session start
+  □ Archive path: work/vuln_fix/<repo>/archive/session_<TIMESTAMP>/
+  □ New session starts with clean state files
 
-PHASE 4:
-  □ Log directory variable name confirmed and used correctly
-  □ mkdir -p "$ARCHIVE_DIR" called before archive_state_file calls
-  □ archive_state_file only moves file if it exists and is non-empty
+PATH SAFETY:
+  □ All $VARIABLES in paths are double-quoted
+  □ mkdir -p called before every cp/mv to new directory
+  □ All path variables declared after export.txt is read
+  □ No hardcoded paths anywhere
+
+MAVEN BUILD INTEGRITY:
+  □ build_truly_passed() checks exit code AND log content
+  □ Looks for: BUILD FAILURE, COMPILATION ERROR, cannot find symbol
+  □ Requires explicit "BUILD SUCCESS" in output
+  □ -B --fail-at-end flags added
+
+KB INTEGRITY:
+  □ KB only updated after build_validated = True
+  □ KB nexusiq_verified only set after clean scan confirmed
+  □ KB never deleted, never archived, never cleared per session
+  □ KB short-circuit skips all tier chain when match found
 
 UNCHANGED — CONFIRM EXPLICITLY:
-  □ attempted_artifacts.txt path/logic:   NOT TOUCHED
-  □ collision_state.txt path/logic:       NOT TOUCHED
-  □ Session ID / Run ID declaration:      NOT TOUCHED
-  □ Repo selection logic:                 NOT TOUCHED
-  □ export.txt read line:                 NOT TOUCHED
-  □ nexus_auto_fix.py:                    NOT TOUCHED
-  □ All other files:                      NOT TOUCHED
-  □ No state file is ever deleted:        CONFIRMED
+  □ export.txt / machine_paths.env: NOT TOUCHED
+  □ ADO tag detection logic: NOT TOUCHED
+  □ NexusIQ report download logic: NOT TOUCHED
+  □ ACS integration logic: NOT TOUCHED (unless Gap fix required it)
+  □ PR creation logic: NOT TOUCHED
+  □ All other files in explorer: NOT TOUCHED
 ```
 
 ---
@@ -320,39 +893,41 @@ UNCHANGED — CONFIRM EXPLICITLY:
 ## FINAL REPORT FORMAT
 
 ```
-SESSION SCOPING PATTERN FOUND:
-  attempted_artifacts.txt uses  : <exact variable/pattern>
-  collision_state.txt uses      : <exact variable/pattern>
-  Log/archive directory variable: <variable name>
+FILES CHANGED:
+  nexusiq_auto_vuln_fix.sh → <sections modified>
+  nexus_auto_fix.py        → <functions modified or added>
 
-CHANGES MADE:
-  HISTORY_FILE  : <old path> → <new scoped path>
-  ROLLBACK_FILE : <old path> → <new scoped path>
-  archive_state_file() added at : line ___
-  Archive block location        : <after export.txt read / replaced cleanup block>
-  Files archived per session    : attempted_artifacts.txt,
-                                  collision_state.txt,
-                                  all_decisions_history.json,
-                                  rolled_back_fixes.txt
+GAPS FIXED:
+  Gap 1  (KB short-circuit):        <one line>
+  Gap 2  (Maven compilation check): <one line>
+  Gap 3  (best combination):        <one line>
+  Gap 4  (session isolation):       <one line>
+  Gap 5  (NexusIQ verification):    <one line>
+  Gap 6  (collision history):       <one line>
+  Gap 7  (POM re-diff):             <one line>
+  Gap 8  (BOM Tier 3 intercept):    <one line>
+  Gap 9  (XML namespace):           <one line>
+  Gap 10 (semver crash):            <one line>
+  Gap 11 (NexusIQ retry):           <one line>
+  Gap 12 (convergence guard):       <one line>
 
-ARCHIVE STRUCTURE:
-  Root: <actual ARCHIVE_DIR path using your variable>
-  Per-session folder: session_<YYYYMMDD_HHMMSS>
+SESSION ISOLATION:
+  kb.json:                  PRESERVED across sessions
+  All other state files:    ARCHIVED per session to archive/session_<TS>/
 
-UNCHANGED CONFIRMED:
-  All existing state file logic  : NOT TOUCHED
-  No file deleted anywhere       : CONFIRMED
-  All other files                : NOT TOUCHED
-
-EXPECTED RESULT:
-  New session uses fresh scoped state files
-  Previous session state archived to dated subfolder
-  100+ repo pipeline correctly isolates per session selection
-  Full audit trail preserved — nothing lost
+EXPECTED AUTONOMOUS BEHAVIOUR:
+  Iteration 1:  KB hits applied first. Remaining go through tier chain.
+                Best combination applied if normal resolution yields zero.
+                Build checked for compilation errors, not just exit code.
+                Push only if fixes applied. ADO tag waited.
+  Iteration 2+: Fresh NexusIQ report. POM re-diffed. Old state isolated.
+                Verified fixes marked in KB. Collision check uses history.
+                Early exit if zero fixable vulns remain.
+  Cross-session: KB grows stronger. All other state starts fresh.
 ```
 
 ---
 
-*VUIAutomation · Session isolation + archive · nexusiq_auto_vuln_fix.sh only*
-*Archive not delete — state preserved per session in dated subfolders*
-*Match existing scoping pattern exactly — do not invent a new one*
+*VUIAutomation · nexusiq_auto_vuln_fix.sh + nexus_auto_fix.py*
+*ADO tag-based loop · KB persists · All other state session-isolated*
+*Maven compilation errors caught · Best combination fallback · 100% autonomous*
