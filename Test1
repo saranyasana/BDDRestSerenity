@@ -1,0 +1,349 @@
+# VSCode Agent 4.1 — Re-Scan Loop Fix Prompt
+
+## Project: VUIAutomation | Target: Second Iteration Fix
+
+### Paste this entire file as your agent prompt. Do not modify it.
+
+-----
+
+## AGENT IDENTITY & OPERATING CONTRACT
+
+You are a surgical code repair agent. Your job is to fix **one specific bug** in this codebase: the Re-Scan Loop always fails from the second iteration onward with no fixes applied.
+
+You operate under a strict non-negotiation contract:
+
+```
+WHAT YOU MAY TOUCH   → Only the Re-Scan Loop iteration logic
+WHAT YOU MAY NOT TOUCH → Every other function, class, file, and flow
+WHAT YOU MUST NEVER DO → Refactor, rename, reformat, or "improve" anything
+                          outside the fix scope
+WHAT YOU MUST ALWAYS DO → Read before writing. Understand before changing.
+```
+
+If you are unsure whether a change is in scope — **do not make it.**
+
+-----
+
+## PHASE 1 — READ FIRST (mandatory before any edit)
+
+Before writing a single line of code, you must read and understand the following.
+Search the codebase and locate each item. If you cannot find one, report it — do not guess.
+
+### 1.1  Find and read these files/functions
+
+```
+SEARCH FOR:
+  □  The Re-Scan Loop entry point       (Start2 / ReScanLoop equivalent)
+  □  The function that downloads fresh reports for iteration 2+  (Step2_2 equivalent)
+  □  The function that runs Vuln Fix in iteration 2+             (Step3_2 equivalent)
+  □  The CollisionCheck function / logic
+  □  The ApplyFixes function called in iteration 2+              (ApplyFixes2 equivalent)
+  □  Any variable or structure that holds state between iterations
+  □  Where attempted artifacts / previous decisions are stored (if at all)
+  □  Where the POM file is read in iteration 2+ — note the exact file path used
+```
+
+### 1.2  Answer these questions internally before editing
+
+```
+Q1. In iteration 2, does Step3_2 re-parse the current pom.xml from disk,
+    or does it use a cached/in-memory copy from iteration 1?
+
+Q2. Does the attempted-artifacts set (or equivalent) get reset or
+    re-initialized at the start of each iteration?
+
+Q3. In CollisionCheck, how is a "collision" defined?
+    Does it treat (same GA, same version) as a collision?
+    Does it treat (already attempted, no fix found) as a collision?
+
+Q4. After iteration 1 applies partial fixes, does Step2_2 download a
+    genuinely fresh report, or reuse the report from iteration 1?
+
+Q5. When CollisionCheck finds that all remaining vulns were already
+    attempted in iteration 1, which branch does it take?
+    Does it go to End2 even though some could be retried with a better tier?
+```
+
+Only after answering all five questions internally should you proceed to Phase 2.
+
+-----
+
+## PHASE 2 — ROOT CAUSES TO FIX
+
+Fix **exactly these four problems** and nothing else.
+
+-----
+
+### BUG 1 — POM state not re-read between iterations
+
+**Symptom:** Step3_2 produces zero new fix decisions because it compares the fresh
+scan report against a stale in-memory vulnerability list, not the current pom.xml on disk.
+
+**Fix:** Before Step3_2 runs in iteration 2+, add a re-diff step that:
+
+1. Reads the **current pom.xml from disk** (not from memory)
+1. Resolves the current version of every artifact in the POM
+1. Removes from the vuln list any artifact whose POM version **already differs**
+   from the vulnerable version in the report (meaning iteration 1 already fixed it)
+1. Keeps transitive-only vulns (they have no direct POM entry to check)
+1. Passes only the **genuinely remaining** vulns to Step3_2
+
+```python
+# Reference implementation — adapt to match your codebase's style exactly
+
+def get_remaining_vulns_after_pom_patch(fresh_report_vulns, pom_path):
+    """
+    Re-diff the fresh scan report against the current on-disk POM.
+    Returns only vulns that are genuinely still present after iteration 1 fixes.
+    Do NOT call this in iteration 1 — only iteration 2+.
+    """
+    current_pom_versions = parse_pom_resolved_versions(pom_path)
+    remaining = []
+
+    for vuln in fresh_report_vulns:
+        ga = f"{vuln.group_id}:{vuln.artifact_id}"
+        current_ver = current_pom_versions.get(ga)
+
+        if current_ver is None:
+            # Transitive dep — no direct POM entry, still needs checking
+            remaining.append(vuln)
+        elif current_ver == vuln.current_version:
+            # POM still has the vulnerable version — genuinely unfixed
+            remaining.append(vuln)
+        else:
+            # POM version changed by iteration 1 — already fixed, skip
+            continue
+
+    return remaining
+```
+
+**Insertion point:** Insert this call in the Re-Scan Loop, after Step2_2 (fresh download)
+and before Step3_2 (vuln fix). Do not change Step2_2 or Step3_2 themselves.
+
+-----
+
+### BUG 2 — Attempted-artifacts set resets each iteration
+
+**Symptom:** Every iteration re-attempts artifacts that were already tried and have
+no fix, wasting cycles and polluting the collision check with false entries.
+
+**Fix:** Create a single `attempted_artifacts` dict that persists for the entire
+pipeline run (not just one iteration). Store the tier used for each attempted fix.
+On each iteration, skip artifacts already attempted **unless** the current tier
+is strictly better (lower tier number) than the previous attempt.
+
+```python
+# Reference implementation — adapt to match your codebase's style exactly
+
+# Declare ONCE outside the iteration loop — at pipeline/run level
+attempted_artifacts: dict[str, int] = {}
+# Key: "groupId:artifactId"   Value: FixTier.value of last attempt
+
+def get_truly_new_fixes(decisions, attempted_artifacts):
+    """
+    Filter fix decisions to only those that are genuinely new this iteration.
+    A fix is new if:
+      - This artifact has never been attempted before, OR
+      - The current tier is strictly better (lower value) than the last attempt
+    Do not modify the decisions list — return a new filtered list.
+    """
+    new_fixes = []
+    for d in decisions:
+        ga = f"{d.vuln.group_id}:{d.vuln.artifact_id}"
+        last_tier = attempted_artifacts.get(ga)
+
+        if last_tier is None:
+            # First time seeing this artifact
+            new_fixes.append(d)
+            attempted_artifacts[ga] = d.tier.value
+        elif d.tier.value < last_tier:
+            # Better fix found this iteration — worth retrying
+            new_fixes.append(d)
+            attempted_artifacts[ga] = d.tier.value
+        # else: same or worse tier — skip silently
+
+    return new_fixes
+```
+
+**Insertion point:** Call `get_truly_new_fixes()` after Step3_2 produces its decisions,
+before those decisions enter CollisionCheck. Do not change Step3_2 itself.
+
+-----
+
+### BUG 3 — CollisionCheck misclassifies already-attempted vulns as collisions
+
+**Symptom:** CollisionCheck treats “same artifact seen in a previous iteration” as a
+collision, routing to `End2` even when the artifact could be re-attempted with a
+better-tier fix or skipped silently (not sent to End2).
+
+**Fix:** Rewrite the collision classification logic to use three categories:
+
+|Category      |Definition                                      |Action                    |
+|--------------|------------------------------------------------|--------------------------|
+|Unique        |Artifact not seen in any previous iteration     |→ ApplyFixes2             |
+|Retry         |Seen before, but current tier is strictly better|→ ApplyFixes2             |
+|Skip          |Seen before, same or worse tier, same version   |→ skip silently (log only)|
+|True Collision|Seen before, same tier, DIFFERENT target version|→ End2                    |
+
+```python
+# Reference implementation — adapt to match your codebase's style exactly
+
+def collision_check(iteration_decisions, all_previous_decisions):
+    """
+    Classify each fix decision for this iteration.
+    Returns (apply_list, collision_list).
+    Only route to End2 if collision_list is non-empty AND apply_list is empty.
+    """
+    previous_map: dict[str, tuple[str, int]] = {}
+    # Key: GA    Value: (safe_version, tier_value) from previous iterations
+
+    for d in all_previous_decisions:
+        ga = f"{d.vuln.group_id}:{d.vuln.artifact_id}"
+        previous_map[ga] = (d.safe_version, d.tier.value)
+
+    apply_list     = []
+    collision_list = []
+
+    for d in iteration_decisions:
+        ga = f"{d.vuln.group_id}:{d.vuln.artifact_id}"
+
+        if ga not in previous_map:
+            # Never seen — apply it
+            apply_list.append(d)
+            continue
+
+        prev_version, prev_tier = previous_map[ga]
+
+        if d.tier.value < prev_tier:
+            # Better tier found — retry
+            apply_list.append(d)
+        elif d.safe_version != prev_version:
+            # Same or worse tier, but targeting a DIFFERENT version — true collision
+            collision_list.append(d)
+        else:
+            # Same tier, same version — idempotent, skip silently
+            pass
+
+    return apply_list, collision_list
+
+# Routing rule (update your flowchart logic to match):
+#   if apply_list:      → ApplyFixes2 (use apply_list)
+#   elif collision_list: → End2
+#   else:               → End2  (nothing new — do not loop again)
+```
+
+**Insertion point:** Replace or patch the existing CollisionCheck logic only.
+Do not change ApplyFixes2 or the downstream steps.
+
+-----
+
+### BUG 4 — Fresh report not genuinely fresh in iteration 2+
+
+**Symptom:** Step2_2 either reuses the report object from iteration 1 in memory,
+or re-downloads but parses into the same variable, so the re-diff in Bug 1’s fix
+sees stale data.
+
+**Fix:** Verify (do not assume) that Step2_2 does the following:
+
+1. Makes a live network/file call — not returning a cached result
+1. Parses the result into a **new list/object** — not overwriting in place
+1. Passes the new list forward as the input to the re-diff step
+
+If Step2_2 already does all three correctly, make no change to it.
+If any one of the three is missing, add only the missing piece.
+Do not refactor Step2_2 — patch the minimum necessary.
+
+-----
+
+## PHASE 3 — CHANGE RULES (read every rule before editing)
+
+```
+RULE 1 — One function at a time
+  Make one change, then re-read the surrounding code before the next change.
+  Never batch-edit multiple functions in one step.
+
+RULE 2 — Additive only
+  Add new helper functions rather than rewriting existing ones.
+  Only modify an existing function if the bug physically lives inside it
+  and cannot be fixed by wrapping it.
+
+RULE 3 — No collateral changes
+  Do not fix linting warnings, rename variables, adjust formatting,
+  add logging to unrelated functions, or make any change not directly
+  required to fix Bugs 1–4.
+
+RULE 4 — Preserve all existing function signatures
+  If an existing function's signature must change to pass new state
+  (e.g. attempted_artifacts), add the new parameter with a default value
+  so all existing call sites continue to work without modification.
+
+RULE 5 — No new dependencies
+  Do not import new libraries. Use only what is already imported in the file.
+
+RULE 6 — State lives at the right level
+  attempted_artifacts must be declared at pipeline/run level — above the
+  iteration loop. Verify the correct scope before placing it.
+
+RULE 7 — Test the routing logic in your head first
+  Before editing CollisionCheck routing, manually trace through a scenario
+  where all iteration-2 vulns were already attempted in iteration 1.
+  Confirm your fix routes to End2 (nothing new) rather than looping forever.
+```
+
+-----
+
+## PHASE 4 — VERIFICATION CHECKLIST
+
+After making all changes, verify each item before declaring done:
+
+```
+□  Iteration 1 path is 100% unchanged — trace it manually
+□  attempted_artifacts is declared outside the iteration loop
+□  get_remaining_vulns_after_pom_patch() is called ONLY in iteration 2+
+□  get_truly_new_fixes() is called after Step3_2, before CollisionCheck
+□  CollisionCheck now has correct three-way routing:
+       apply_list non-empty → ApplyFixes2
+       apply_list empty + collision_list → End2
+       both empty → End2
+□  pom.xml is read from disk in the re-diff step, not from memory
+□  Step2_2 genuinely produces a fresh report object each iteration
+□  No existing function signatures broken (all call sites still compile)
+□  No imports added
+□  No unrelated code changed
+□  MoreFixes -- Yes --> Start2  loop still terminates correctly
+   (it will reach End2 when apply_list and collision_list are both empty)
+```
+
+-----
+
+## PHASE 5 — WHAT TO REPORT WHEN DONE
+
+When all changes are complete, provide this report and nothing else:
+
+```
+FILES CHANGED:
+  <filename>  →  <function(s) modified or added>
+
+BUGS FIXED:
+  Bug 1 (POM re-read):          <one line: what you found and what you changed>
+  Bug 2 (Attempted set):        <one line: where you placed attempted_artifacts>
+  Bug 3 (CollisionCheck):       <one line: what the old logic did wrong>
+  Bug 4 (Fresh report):         <one line: was Step2_2 already correct or not>
+
+UNCHANGED (confirm explicitly):
+  Iteration 1 path:             UNTOUCHED
+  ApplyFixes1:                  UNTOUCHED
+  BuildTest / Verify / Push:    UNTOUCHED
+  KB stage / Post-push:         UNTOUCHED
+  All other pipeline logic:     UNTOUCHED
+
+SECOND ITERATION NOW:
+  <one sentence describing what will happen in iteration 2 after the fix>
+```
+
+Do not include code diffs, explanations, or suggestions in the report.
+The report must fit the template exactly.
+
+-----
+
+*VSCode Agent 4.1 · VUIAutomation Re-Scan Loop Fix · Surgical patch only*
