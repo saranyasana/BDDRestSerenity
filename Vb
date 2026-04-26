@@ -1,0 +1,358 @@
+# VUIAutomation — Session Isolation Fix (Archive Edition)
+## VSCode Agent · GPT-4.1 · nexusiq_auto_vuln_fix.sh only
+### Paste this entire file as your agent prompt. Do not modify it.
+
+---
+
+## THE PROBLEM — READ THIS FIRST
+
+```
+This pipeline runs against a SELECTED SET of repos each session.
+100+ repos exist. Each session picks a different subset.
+
+The previous fix added new state files without session scoping:
+  all_decisions_history.json
+  rolled_back_fixes.txt
+
+These files are written to a flat $WORK_DIR path with no
+session identifier. When a new session starts with different
+repos, it reads the old state files and operates on the
+repos from the PREVIOUS session — not the current selection.
+
+THE FIX:
+  1. Find how existing state files are already scoped per session
+  2. Apply the exact same scoping to the two new files
+  3. Instead of deleting old state files at session start —
+     ARCHIVE them to a dated subfolder so they are preserved
+     for audit and debugging
+  Nothing else changes.
+```
+
+---
+
+## ARCHITECTURE REMINDER
+
+```
+Bundle/unbundle pipeline — all paths come from export.txt.
+Every path variable MUST be declared after export.txt is read.
+Do not move, edit, or touch export.txt or the line that reads it.
+```
+
+---
+
+## OPERATING CONTRACT
+
+```
+FILE YOU MAY EDIT    : nexusiq_auto_vuln_fix.sh ONLY
+EVERYTHING ELSE      : DO NOT TOUCH
+SCOPE OF THIS FIX    : Session isolation + archive for two new state
+                       files only. Nothing else. No other changes.
+```
+
+---
+
+## PHASE 1 — FIND THESE THINGS FIRST
+
+Do not edit anything until you have found and reported all of these.
+
+```
+FIND AND REPORT:
+
+  □ How attempted_artifacts.txt is named/pathed
+    → Does it include a session ID, timestamp, or run ID?
+    → What is the exact variable or expression used?
+    → LINE: ___   PATTERN: ___
+
+  □ How collision_state.txt is named/pathed
+    → Same question — what scoping does it use?
+    → LINE: ___   PATTERN: ___
+
+  □ Where SESSION_ID / RUN_ID / TIMESTAMP is declared
+    → What is the variable name your script uses?
+    → LINE: ___   VARIABLE NAME: ___
+
+  □ Where HISTORY_FILE is declared
+    → Is it using the same session scoping as attempted_artifacts?
+    → LINE: ___   CURRENTLY SCOPED: yes / no
+
+  □ Where ROLLBACK_FILE is declared
+    → Is it using the same session scoping?
+    → LINE: ___   CURRENTLY SCOPED: yes / no
+
+  □ Whether the script has an existing cleanup/reset block
+    at session start that touches any state files
+    → EXISTS: yes / no
+    → If yes: LINE: ___  WHAT IT DOES: ___
+
+  □ Where the archive/logs directory is for this pipeline
+    → What variable holds the log/archive directory path?
+    → LINE: ___   VARIABLE NAME: ___
+```
+
+**Report all findings. Then proceed to Phase 2.**
+
+---
+
+## PHASE 2 — SCOPE THE TWO NEW FILES
+
+After Phase 1, you know exactly how `attempted_artifacts.txt`
+and `collision_state.txt` are scoped per session.
+
+Apply the EXACT SAME scoping pattern to `HISTORY_FILE`
+and `ROLLBACK_FILE`. Nothing else.
+
+```bash
+# EXAMPLE ONLY — your actual pattern will differ.
+# Match whatever pattern attempted_artifacts.txt uses.
+
+# If attempted_artifacts.txt uses a session timestamp:
+ATTEMPTED_FILE="$WORK_DIR/${SESSION_ID}_attempted_artifacts.txt"
+# Then:
+HISTORY_FILE="$WORK_DIR/${SESSION_ID}_all_decisions_history.json"
+ROLLBACK_FILE="$WORK_DIR/${SESSION_ID}_rolled_back_fixes.txt"
+
+# If attempted_artifacts.txt uses a run directory:
+ATTEMPTED_FILE="$RUN_DIR/attempted_artifacts.txt"
+# Then:
+HISTORY_FILE="$RUN_DIR/all_decisions_history.json"
+ROLLBACK_FILE="$RUN_DIR/rolled_back_fixes.txt"
+
+# If attempted_artifacts.txt uses a repo hash:
+ATTEMPTED_FILE="$WORK_DIR/${REPO_HASH}_attempted_artifacts.txt"
+# Then:
+HISTORY_FILE="$WORK_DIR/${REPO_HASH}_all_decisions_history.json"
+ROLLBACK_FILE="$WORK_DIR/${REPO_HASH}_rolled_back_fixes.txt"
+```
+
+**Use whatever pattern the existing files use. Do not invent a new one.**
+
+---
+
+## PHASE 3 — ARCHIVE INSTEAD OF DELETE
+
+This is the critical change from any previous prompt version.
+**Do NOT delete state files. Archive them.**
+
+### 3.1  Find the existing cleanup block
+
+If the script has an existing block that cleans up state files
+at session start (found in Phase 1), it likely looks like:
+
+```bash
+# Existing pattern — may use rm, unset, or truncate:
+rm -f "$ATTEMPTED_FILE"
+rm -f "$COLLISION_STATE_FILE"
+# OR
+> "$ATTEMPTED_FILE"    # truncate
+```
+
+### 3.2  Replace delete with archive in that block
+
+**Do NOT delete. Move to an archive folder instead.**
+
+```bash
+# ARCHIVE HELPER — add this function once, near other helper
+# functions in the script. Do not add it inside a loop.
+
+archive_state_file() {
+    local file_path="$1"
+    local archive_base="$2"    # the archive root directory
+
+    # Only archive if the file actually exists and is non-empty
+    if [ ! -f "$file_path" ] || [ ! -s "$file_path" ]; then
+        return 0
+    fi
+
+    # Build archive subdirectory using timestamp of the file
+    # so each session's archive is clearly separated
+    local file_timestamp
+    file_timestamp=$(python3 -c "
+import os, datetime
+t = os.path.getmtime('$file_path')
+print(datetime.datetime.fromtimestamp(t).strftime('%Y%m%d_%H%M%S'))
+" 2>/dev/null || date '+%Y%m%d_%H%M%S')
+
+    local archive_dir="$archive_base/session_${file_timestamp}"
+    mkdir -p "$archive_dir"
+
+    # Move the file — preserves content, frees the path for new session
+    mv "$file_path" "$archive_dir/$(basename "$file_path")"
+    log "[ARCHIVE] $(basename "$file_path") → $archive_dir"
+}
+```
+
+### 3.3  Replace the cleanup block calls
+
+Find where state files are cleaned at session start.
+Replace every `rm -f "$STATE_FILE"` with `archive_state_file`:
+
+```bash
+# BEFORE (delete):
+rm -f "$ATTEMPTED_FILE"
+rm -f "$COLLISION_STATE_FILE"
+
+# AFTER (archive):
+ARCHIVE_DIR="$LOG_DIR/state_archive"   # use your existing log directory variable
+archive_state_file "$ATTEMPTED_FILE"      "$ARCHIVE_DIR"
+archive_state_file "$COLLISION_STATE_FILE" "$ARCHIVE_DIR"
+```
+
+### 3.4  Add HISTORY_FILE and ROLLBACK_FILE to the same archive block
+
+```bash
+# ADD alongside the existing files in the same block:
+archive_state_file "$HISTORY_FILE"   "$ARCHIVE_DIR"
+archive_state_file "$ROLLBACK_FILE"  "$ARCHIVE_DIR"
+```
+
+### 3.5  If NO cleanup block exists
+
+If Phase 1 found no existing cleanup block:
+
+```bash
+# ADD a new archive block immediately AFTER export.txt is read
+# and AFTER all path variables are declared
+# and BEFORE the while loop starts:
+
+ARCHIVE_DIR="$LOG_DIR/state_archive"   # use your log dir variable
+mkdir -p "$ARCHIVE_DIR"
+
+# Archive any leftover state from a previous session
+archive_state_file "$ATTEMPTED_FILE"       "$ARCHIVE_DIR"
+archive_state_file "$COLLISION_STATE_FILE" "$ARCHIVE_DIR"
+archive_state_file "$HISTORY_FILE"         "$ARCHIVE_DIR"
+archive_state_file "$ROLLBACK_FILE"        "$ARCHIVE_DIR"
+```
+
+---
+
+## PHASE 4 — VERIFY ARCHIVE FOLDER VARIABLE
+
+The archive function uses `$LOG_DIR` (or your equivalent log directory
+variable). Verify:
+
+```
+  □ What is the actual variable name for your log/output directory?
+    (seen in logs as: .../VUIAutomation/work/vuln_fix/logs_20260426_...)
+    It may be LOG_DIR, LOGS_DIR, OUTPUT_DIR, or similar.
+
+  □ Is it declared after export.txt is read? (it must be)
+
+  □ Use that exact variable name in ARCHIVE_DIR — do not hardcode a path.
+```
+
+If the log directory variable is `LOGS_DIR` not `LOG_DIR`, use `$LOGS_DIR`.
+If it is `OUTPUT_DIR`, use `$OUTPUT_DIR`. Match exactly what exists.
+
+---
+
+## WHAT THE ARCHIVE STRUCTURE WILL LOOK LIKE
+
+After this fix, previous session state is preserved like this:
+
+```
+$LOG_DIR/
+  state_archive/
+    session_20260425_142233/        ← yesterday's session
+      attempted_artifacts.txt
+      collision_state.txt
+      all_decisions_history.json
+      rolled_back_fixes.txt
+    session_20260426_091045/        ← this morning's session
+      attempted_artifacts.txt
+      collision_state.txt
+      all_decisions_history.json
+      rolled_back_fixes.txt
+```
+
+Each session gets its own subfolder named by the timestamp of the
+state files from that session. Nothing is ever deleted.
+New session starts with clean state files at their scoped paths.
+
+---
+
+## VERIFICATION CHECKLIST
+
+```
+PHASE 1:
+  □ Session scoping pattern of attempted_artifacts.txt identified
+  □ Session scoping pattern of collision_state.txt identified
+  □ Both use same pattern (confirmed yes/no)
+  □ SESSION_ID / RUN_ID / equivalent variable name found
+  □ Log/archive directory variable name found
+  □ Existing cleanup block found or confirmed absent
+
+PHASE 2:
+  □ HISTORY_FILE now uses exact same scoping as attempted_artifacts.txt
+  □ ROLLBACK_FILE now uses exact same scoping as attempted_artifacts.txt
+  □ Both still declared AFTER export.txt is read
+  □ No other variable declarations changed
+
+PHASE 3:
+  □ archive_state_file() function added once (not inside a loop)
+  □ ARCHIVE_DIR uses existing log directory variable (not hardcoded)
+  □ If cleanup block existed:
+      - rm -f replaced with archive_state_file for existing files
+      - HISTORY_FILE and ROLLBACK_FILE added to same block
+  □ If no cleanup block existed:
+      - New archive block added after export.txt read, before while loop
+      - All four state files included
+  □ No state file is deleted anywhere — only moved via mv
+
+PHASE 4:
+  □ Log directory variable name confirmed and used correctly
+  □ mkdir -p "$ARCHIVE_DIR" called before archive_state_file calls
+  □ archive_state_file only moves file if it exists and is non-empty
+
+UNCHANGED — CONFIRM EXPLICITLY:
+  □ attempted_artifacts.txt path/logic:   NOT TOUCHED
+  □ collision_state.txt path/logic:       NOT TOUCHED
+  □ Session ID / Run ID declaration:      NOT TOUCHED
+  □ Repo selection logic:                 NOT TOUCHED
+  □ export.txt read line:                 NOT TOUCHED
+  □ nexus_auto_fix.py:                    NOT TOUCHED
+  □ All other files:                      NOT TOUCHED
+  □ No state file is ever deleted:        CONFIRMED
+```
+
+---
+
+## FINAL REPORT FORMAT
+
+```
+SESSION SCOPING PATTERN FOUND:
+  attempted_artifacts.txt uses  : <exact variable/pattern>
+  collision_state.txt uses      : <exact variable/pattern>
+  Log/archive directory variable: <variable name>
+
+CHANGES MADE:
+  HISTORY_FILE  : <old path> → <new scoped path>
+  ROLLBACK_FILE : <old path> → <new scoped path>
+  archive_state_file() added at : line ___
+  Archive block location        : <after export.txt read / replaced cleanup block>
+  Files archived per session    : attempted_artifacts.txt,
+                                  collision_state.txt,
+                                  all_decisions_history.json,
+                                  rolled_back_fixes.txt
+
+ARCHIVE STRUCTURE:
+  Root: <actual ARCHIVE_DIR path using your variable>
+  Per-session folder: session_<YYYYMMDD_HHMMSS>
+
+UNCHANGED CONFIRMED:
+  All existing state file logic  : NOT TOUCHED
+  No file deleted anywhere       : CONFIRMED
+  All other files                : NOT TOUCHED
+
+EXPECTED RESULT:
+  New session uses fresh scoped state files
+  Previous session state archived to dated subfolder
+  100+ repo pipeline correctly isolates per session selection
+  Full audit trail preserved — nothing lost
+```
+
+---
+
+*VUIAutomation · Session isolation + archive · nexusiq_auto_vuln_fix.sh only*
+*Archive not delete — state preserved per session in dated subfolders*
+*Match existing scoping pattern exactly — do not invent a new one*
