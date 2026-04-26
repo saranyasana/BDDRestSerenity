@@ -1,0 +1,801 @@
+# VUIAutomation — Re-Scan Loop Fix Prompt
+
+## VSCode Agent 4.1 | GPT-4.1 | Surgical Patch Only
+
+### Paste this entire file into the agent. Do not modify it.
+
+-----
+
+## WHAT YOU KNOW ABOUT THIS CODEBASE
+
+Before touching anything, internalize this. It was extracted directly from the
+codebase structure. Do not re-discover it — use it.
+
+```
+ORCHESTRATOR SHELL SCRIPT : nexusiq_auto_vuln_fix.sh
+PYTHON FIX ENGINE         : nexus_auto_fix.py
+LOOP TYPE                 : while loop  (top of Re-Scan Loop section in .sh)
+                            for loops inside  (per-repo processing)
+MAX_ITERATIONS            : declared at top of nexusiq_auto_vuln_fix.sh
+
+PIPELINE STEP SEQUENCE (from error.log, lines 1-26):
+  1.  Start Step 3: Vulnerability Fix Pipeline
+  2.  Clone/Prepare Repo Workdirs
+  3.  Download Latest NexusIQ Reports
+  4.  Download PDF for each repo
+  5.  Copy to repo/latest_report.pdf
+  6.  Begin Re-Scan Loop          ← while loop starts here
+  7.  For Each Repo:              ← for loop starts here
+  8.    Reload pom.xml from Disk
+  9.    Load vulns.json
+  10.   Run Fix Resolution (nexus_auto_fix.py)
+  11.   Apply fixes to pom.xml
+  12.   Atomic write of pom.xml
+  13.   Classify fix tier
+  14.   Check for collisions
+  15.   Update attempted_artifacts.txt
+  16.   Update collision_state.txt
+  17.   Write fix_results.json
+  18.   Any Unfixed Vulnerabilities?
+  19.   Yes: Repeat Re-Scan Loop
+  20.   No: All Vulnerabilities Fixed
+  21.   Commit & Push Fixes
+  22.   Check for version downgrades
+  23.   Bump SNAPSHOT version
+  24.   Add pipeline triggers
+  25.   Create Pull Request
+  26.   End Step 3
+
+STATE FILES AND THEIR EXACT BEHAVIOUR:
+  attempted_artifacts.txt
+    → Bash associative array in nexusiq_auto_vuln_fix.sh
+    → persisted to file, reloaded each iteration       ✅ persists correctly
+    → BUG: only stores whether artifact was attempted,
+           NOT which tier was used last time            ❌ needs tier value added
+
+  collision_state.txt
+    → Bash associative array in nexusiq_auto_vuln_fix.sh
+    → persisted to file, reloaded each iteration       ✅ persists correctly
+    → BUG: collision check in nexus_auto_fix.py only
+           receives current iteration decisions,
+           NOT all_decisions_ever                       ❌ needs history passed
+
+  fix_results.json
+    → written per-iteration per-repo                   ❌ reset each iteration
+    → all_decisions_ever is NOT accumulated anywhere   ❌ biggest gap
+
+  vulns.json
+    → written per-repo, overwritten each iteration     ✅ correct — fresh each time
+
+  pom.xml
+    → reloaded from disk at line 8 each iteration      ✅ correct
+
+BOM STATE:
+  FixDecision.bom_managed     → present and used through all tiers  ✅
+  FixDecision.patch_property  → present and used through all tiers  ✅
+```
+
+-----
+
+## OPERATING CONTRACT — NON-NEGOTIABLE
+
+```
+FILES YOU MAY EDIT:
+  nexusiq_auto_vuln_fix.sh     (loop logic, state file read/write)
+  nexus_auto_fix.py            (fix resolution, collision check)
+
+FILES YOU MUST NOT TOUCH:
+  extract_nexus_mufg_m...sh    (seen in explorer — do not open or edit)
+  repo_runtime_selector...py   (do not open or edit)
+  automation_ui.py
+  build_pyc_dist.py
+  bundle_scripts.py
+  convert_artifacts_to_excel.py
+  deployment_status_202...py   (all variants)
+  export_project.py
+  setup.py
+  Any file in /tools
+  Any file in /Veracode
+  Any file in /work
+
+RULES:
+  □ Read the full function before editing any line of it
+  □ Add new helper functions rather than rewriting existing ones
+  □ Preserve all existing function signatures — add parameters with defaults only
+  □ Do not reformat, rename, or lint anything outside the fix scope
+  □ Do not add new imports — use only what is already imported
+  □ Make one change at a time — re-read surrounding code between changes
+  □ If a change touches more than 20 lines — stop and confirm with user first
+```
+
+-----
+
+## BUG 1 — attempted_artifacts.txt missing tier value
+
+### Where it is
+
+`nexusiq_auto_vuln_fix.sh` — the section that writes `attempted_artifacts.txt`
+after line 15 in the pipeline sequence.
+
+### What is wrong
+
+The file stores only whether an artifact was attempted (`ga → 1` or `ga → true`).
+It does not store which tier was used. So on iteration 2+, the code cannot tell
+whether a better-tier fix is now available for a previously attempted artifact.
+
+### Exact fix
+
+In `nexusiq_auto_vuln_fix.sh`, find where `attempted_artifacts.txt` is written.
+Change the stored value from a boolean/flag to the tier number used.
+
+```bash
+# BEFORE (find this pattern — exact syntax may differ):
+attempted_artifacts["$ga"]=1
+
+# AFTER:
+attempted_artifacts["$ga"]=$tier_used
+# where $tier_used is the tier value (1-5) from the fix result
+```
+
+When reloading `attempted_artifacts.txt` at the start of each iteration,
+the tier value is now available for comparison.
+
+In `nexus_auto_fix.py`, find where attempted artifacts are checked.
+Change the check from:
+
+```python
+# BEFORE:
+if ga in attempted_artifacts:
+    skip   # always skip if attempted
+
+# AFTER:
+last_tier = attempted_artifacts.get(ga)
+if last_tier is not None and int(last_tier) <= current_decision.tier.value:
+    skip   # only skip if current tier is same or worse
+# if current tier is strictly better — do NOT skip, allow retry
+```
+
+**Do not change anything else in this function.**
+
+-----
+
+## BUG 2 — all_decisions_ever not accumulated across iterations
+
+### Where it is
+
+`nexusiq_auto_vuln_fix.sh` — between lines 17 (Write fix_results.json)
+and line 18 (Any Unfixed Vulnerabilities).
+`nexus_auto_fix.py` — wherever collision_check() is defined and called.
+
+### What is wrong
+
+`fix_results.json` is overwritten each iteration. There is no file or variable
+that accumulates all fix decisions across ALL iterations. The collision check
+therefore only sees the current iteration — meaning decisions from iteration 1
+are invisible to iteration 3+, and true collisions from early iterations
+get re-attempted silently.
+
+### Exact fix — Shell side
+
+In `nexusiq_auto_vuln_fix.sh`, after the line that writes `fix_results.json`,
+add an append step:
+
+```bash
+# ADD AFTER the line that writes fix_results.json:
+# Append current iteration results to the cumulative history file
+HISTORY_FILE="$WORK_DIR/all_decisions_history.json"
+
+if [ ! -f "$HISTORY_FILE" ]; then
+    echo "[]" > "$HISTORY_FILE"
+fi
+
+# Append current fix_results.json into the history array
+python3 -c "
+import json, sys
+history_path = '$HISTORY_FILE'
+current_path = '$FIX_RESULTS_FILE'
+with open(history_path) as f:
+    history = json.load(f)
+with open(current_path) as f:
+    current = json.load(f)
+if isinstance(current, list):
+    history.extend(current)
+else:
+    history.append(current)
+with open(history_path, 'w') as f:
+    json.dump(history, f, indent=2)
+"
+```
+
+### Exact fix — Python side
+
+In `nexus_auto_fix.py`, find the `collision_check()` function.
+It currently receives only current iteration decisions.
+Add a parameter to also receive the history:
+
+```python
+# BEFORE (find this signature — exact name may differ):
+def collision_check(current_decisions, collision_state):
+    ...
+
+# AFTER (add history_path with default so existing calls still work):
+def collision_check(current_decisions, collision_state,
+                    history_path=None):
+    
+    all_previous = []
+    if history_path and os.path.exists(history_path):
+        with open(history_path) as f:
+            all_previous = json.load(f)
+    
+    # Build lookup from full history
+    previous_map = {}
+    for d in all_previous:
+        ga = f"{d['group_id']}:{d['artifact_id']}"
+        previous_map[ga] = {
+            'safe_version': d.get('safe_version'),
+            'tier':         d.get('tier', 99)
+        }
+    
+    # Rest of your existing collision logic follows,
+    # but now use previous_map instead of collision_state alone
+    # for the "has this been attempted before" check.
+    # DO NOT change the collision_state read/write logic — keep it as-is.
+```
+
+Pass `history_path` when calling `collision_check()` from the shell:
+
+```bash
+# Find where nexus_auto_fix.py is called with collision check
+# Add the history file path as an argument:
+python3 nexus_auto_fix.py \
+    --mode collision_check \
+    --history "$HISTORY_FILE" \
+    ... (keep all existing args exactly as they are)
+```
+
+**Do not change any other call sites or parameters.**
+
+-----
+
+## BUG 3 — collision_check misclassifies already-attempted artifacts
+
+### Where it is
+
+`nexus_auto_fix.py` — the `collision_check()` function or equivalent logic.
+
+### What is wrong
+
+The current logic has two exits: “Unique Fixes” and “Only Collisions”.
+It treats any artifact seen in a previous iteration as a collision,
+even if the fix version is identical (idempotent) or a better tier is available.
+This causes iteration 2+ to route to End2 even when safe progress is possible.
+
+### Exact fix
+
+Inside `collision_check()`, replace the two-way classification with
+a three-way classification. Find the section that categorises decisions
+and change only that section:
+
+```python
+# Find the section that does something like:
+#   if ga in seen_before: → collision
+#   else: → unique
+# Replace ONLY that classification logic with:
+
+apply_list     = []
+collision_list = []
+
+for d in current_decisions:
+    ga = f"{d.vuln.group_id}:{d.vuln.artifact_id}"
+    prev = previous_map.get(ga)
+
+    if prev is None:
+        # Never seen before — safe to apply
+        apply_list.append(d)
+
+    elif d.safe_version == prev['safe_version']:
+        # Exact same fix — idempotent, skip silently (not a collision)
+        # Do NOT add to collision_list
+        pass
+
+    elif d.tier < prev['tier']:
+        # Better tier found this iteration — worth retrying
+        apply_list.append(d)
+
+    else:
+        # Same or worse tier, different target version — true collision
+        collision_list.append(d)
+
+# Routing (update the if/else that follows this block):
+#   apply_list non-empty               → proceed to ApplyFixes
+#   apply_list empty + collision_list  → route to End (manual review)
+#   both empty                         → route to End (converged cleanly)
+```
+
+**Do not change anything downstream of this routing decision.**
+
+-----
+
+## BUG 4 — POM re-diff not performed before fix resolution in iteration 2+
+
+### Where it is
+
+`nexusiq_auto_vuln_fix.sh` line 9 (Load vulns.json) and
+`nexus_auto_fix.py` — the entry point that receives vulns.
+
+### What is wrong
+
+In iteration 2+, `vulns.json` contains everything the fresh NexusIQ scan found.
+But the POM was already partially patched in iteration 1. The fix engine
+re-attempts artifacts that iteration 1 already fixed, producing zero new decisions.
+
+### Exact fix
+
+In `nexus_auto_fix.py`, add a re-diff function. Call it only when
+`iteration_num > 1`. Find where vulns are loaded and insert:
+
+```python
+def filter_already_fixed_vulns(vulns, pom_path, iteration_num):
+    """
+    Only call this for iteration 2+.
+    Removes vulns whose artifact version in the current POM
+    already differs from the vulnerable version in the scan report.
+    Keeps transitive vulns (no direct POM entry to check).
+    Does not modify pom_path or the vulns list in place.
+    Returns a new filtered list.
+    """
+    if iteration_num <= 1:
+        return vulns    # iteration 1: no filter, use all vulns as-is
+
+    try:
+        tree = ET.parse(pom_path)
+        root = tree.getroot()
+        ns   = detect_namespace(root)   # use your existing namespace detection
+    except ET.ParseError:
+        return vulns    # POM unreadable — pass all vulns, fail safely
+
+    # Build current version map from POM
+    current_versions = {}
+    for dep in root.findall(f".//{ns}dependency"):
+        g = dep.findtext(f"{ns}groupId",    "").strip()
+        a = dep.findtext(f"{ns}artifactId", "").strip()
+        v = dep.findtext(f"{ns}version",    "").strip()
+        if g and a and v:
+            current_versions[f"{g}:{a}"] = v
+
+    remaining = []
+    for vuln in vulns:
+        ga          = f"{vuln.group_id}:{vuln.artifact_id}"
+        current_ver = current_versions.get(ga)
+
+        if current_ver is None:
+            # Transitive — no direct POM entry, keep it
+            remaining.append(vuln)
+        elif current_ver == vuln.current_version:
+            # POM still has vulnerable version — keep it
+            remaining.append(vuln)
+        # else: POM version already changed — iteration 1 fixed it, skip
+
+    return remaining
+```
+
+In the shell script, pass the current iteration number to `nexus_auto_fix.py`:
+
+```bash
+# Find where nexus_auto_fix.py is called
+# Add --iteration $CURRENT_ITERATION to the existing args:
+python3 nexus_auto_fix.py \
+    --iteration $CURRENT_ITERATION \
+    ... (keep all existing args exactly as they are)
+```
+
+-----
+
+## BUG 5 — Fix/rollback cycle burns remaining iterations
+
+### Where it is
+
+`nexusiq_auto_vuln_fix.sh` — the section around line 18-19
+(Any Unfixed Vulnerabilities? → Yes: Repeat Re-Scan Loop).
+
+### What is wrong
+
+If ApplyFixes succeeds but the Maven build fails and the POM is restored
+from backup, the next iteration attempts the exact same fix again.
+This can consume all remaining iterations of your 10-iteration budget.
+
+### Exact fix
+
+Add a rolled-back tracking file alongside `attempted_artifacts.txt`:
+
+```bash
+# After any POM restore-from-backup event, record what was rolled back:
+ROLLBACK_FILE="$WORK_DIR/rolled_back_fixes.txt"
+
+# When a build fails and pom.xml.bak is restored, add to rollback file:
+echo "$ga:$safe_version" >> "$ROLLBACK_FILE"
+```
+
+In `nexus_auto_fix.py`, before queuing a fix decision for application,
+check the rollback file:
+
+```python
+def was_previously_rolled_back(ga, safe_version, rollback_file):
+    """
+    Returns True if this exact GA+version combination was
+    previously applied and then rolled back due to build failure.
+    """
+    if not rollback_file or not os.path.exists(rollback_file):
+        return False
+    with open(rollback_file) as f:
+        for line in f:
+            if line.strip() == f"{ga}:{safe_version}":
+                return True
+    return False
+
+# In your fix application loop, add:
+if was_previously_rolled_back(ga, decision.safe_version, rollback_file):
+    skipped.append(decision)   # do not retry a rolled-back fix
+    continue
+```
+
+-----
+
+## BUG 6 — MAX_ITERATIONS reached discards last good iteration’s fixes
+
+### Where it is
+
+`nexusiq_auto_vuln_fix.sh` — the while loop condition check.
+
+### What is wrong
+
+If iteration 9 applies fixes and the build passes, but iteration 10
+hits MAX_ITERATIONS and exits via End2, iteration 9’s fixes are already
+committed. This is actually fine. But if the loop exits BEFORE the
+commit step runs, the good fixes are lost.
+
+### Exact fix
+
+Verify (do not assume) that when MAX_ITERATIONS is reached, the code
+reaches line 21 (Commit & Push Fixes) before exiting.
+
+Find the MAX_ITERATIONS exit point in the while loop:
+
+```bash
+# Find something like:
+if [ $CURRENT_ITERATION -ge $MAX_ITERATIONS ]; then
+    break   # or exit
+fi
+
+# Verify it is AFTER the commit step, not before.
+# If it is before the commit step, move the check to after commit:
+
+# ... commit & push happens first ...
+if [ $CURRENT_ITERATION -ge $MAX_ITERATIONS ]; then
+    log "MAX_ITERATIONS ($MAX_ITERATIONS) reached. Exiting cleanly."
+    break
+fi
+```
+
+**Only move the check if it is currently before the commit step.
+If it is already after commit, make no change.**
+
+-----
+
+## BOM SAFETY — Tier 3 intercept (prevents silent wrong fix)
+
+### Where it is
+
+`nexus_auto_fix.py` — inside the Tier 3 (Maven Central scan) resolution path.
+
+### What is wrong
+
+When Tier 1 and Tier 2 both fail for a BOM-managed artifact, Tier 3 finds
+a safe version and tries to write it as a direct `<dependency>` version pin.
+But the artifact is BOM-managed — the direct pin is silently ignored or
+conflicts with the BOM property. The fix appears to apply but has no effect.
+
+### Exact fix
+
+In `nexus_auto_fix.py`, find the Tier 3 resolution block.
+`FixDecision.bom_managed` and `FixDecision.patch_property` are already
+present and populated. Add the intercept before the return statement:
+
+```python
+# Find the Tier 3 return statement — something like:
+#   return FixDecision(tier=FixTier.MAVEN_SAFE_VER, safe_version=safe_ver, ...)
+# ADD THIS CHECK immediately before that return:
+
+if triage.get("bom_managed") and triage.get("prop_key"):
+    # Do NOT pin version directly.
+    # Find the BOM property value that corresponds to this artifact version.
+    bom_value = resolve_bom_property_for_artifact_version(
+        triage["prop_key"],
+        safe_ver,
+        pom_path
+    )
+    if bom_value:
+        return FixDecision(
+            vuln           = vuln,
+            tier           = FixTier.MAVEN_SAFE_VER,
+            safe_version   = bom_value,
+            bom_managed    = True,
+            patch_property = triage["prop_key"],
+            use_exclusion  = False,
+            exclusion_targets = [],
+            confidence     = 0.75,
+            reason         = f"BOM property {triage['prop_key']} → {bom_value}"
+        )
+    # If bom_value cannot be resolved, fall through to Tier 4
+    # Do NOT write a direct version pin for a BOM artifact
+
+# Then the existing non-BOM return follows unchanged:
+return FixDecision(
+    tier=FixTier.MAVEN_SAFE_VER,
+    safe_version=safe_ver,
+    bom_managed=False,
+    ...   # keep exactly as-is
+)
+```
+
+Add the helper function (new function, do not modify existing ones):
+
+```python
+def resolve_bom_property_for_artifact_version(prop_key, artifact_version,
+                                               pom_path):
+    """
+    Given a BOM property key and a safe artifact version,
+    return the property value that would resolve to that artifact version.
+    For Spring Boot: spring.boot.version=3.1.4 → resolves spring-boot-starter-*
+    to 3.1.4.
+    For most BOMs the property value IS the artifact version.
+    Override this function if your BOM has an indirect mapping.
+    """
+    # Default: property value equals artifact version (true for Spring BOM)
+    return artifact_version
+```
+
+Also add the major-version safety guard before writing any BOM property:
+
+```python
+def is_bom_bump_safe(prop_key, old_value, new_value):
+    """
+    Returns False if the bump is a major version change.
+    Major BOM bumps (e.g. Spring Boot 2.x → 3.x) require manual review.
+    """
+    old_v = safe_version_parse(old_value)
+    new_v = safe_version_parse(new_value)
+    if old_v and new_v and new_v.major > old_v.major:
+        return False
+    return True
+
+# In apply_property_patches(), add before writing:
+if decision.bom_managed:
+    current_val = get_current_property_value(prop_key, root, ns)
+    if not is_bom_bump_safe(prop_key, current_val, decision.safe_version):
+        suppressed.append(decision)
+        logger.warning(
+            f"BOM major bump skipped — {prop_key}: "
+            f"{current_val} → {decision.safe_version} requires manual review"
+        )
+        continue
+```
+
+-----
+
+## RUNTIME CRASH PREVENTION
+
+These are silent killers — add them without changing any existing logic.
+
+### Crash 1 — XML namespace stripped on POM write
+
+Find your POM write function in `nexus_auto_fix.py`.
+Add namespace registration before every write:
+
+```python
+# ADD at the top of your pom write function, before ET.tostring():
+ET.register_namespace('', 'http://maven.apache.org/POM/4.0.0')
+ET.register_namespace('xsi', 'http://www.w3.org/2001/XMLSchema-instance')
+
+# ADD a dry-run parse after ET.tostring() and before writing to disk:
+xml_string = ET.tostring(root, encoding='unicode', xml_declaration=True)
+try:
+    ET.fromstring(xml_string)           # validates before file write
+except ET.ParseError as e:
+    shutil.copy(f"{pom_path}.bak", pom_path)
+    raise RuntimeError(f"POM write aborted — XML invalid after patch: {e}")
+```
+
+### Crash 2 — semver crash on Maven version strings
+
+Find every call to `packaging.version.Version()` in `nexus_auto_fix.py`.
+Wrap each one with the safe parser (add as a new helper function):
+
+```python
+def safe_version_parse(version_str):
+    from packaging.version import Version, InvalidVersion
+    if not version_str:
+        return None
+    cleaned = (str(version_str)
+               .replace('.Final', '').replace('.RELEASE', '')
+               .replace('.GA', '').replace('-SNAPSHOT', '').strip())
+    try:
+        return Version(cleaned)
+    except InvalidVersion:
+        import re
+        numeric = re.match(r'[\d.]+', cleaned)
+        try:
+            return Version(numeric.group()) if numeric else None
+        except (InvalidVersion, AttributeError):
+            return None
+```
+
+### Crash 3 — NexusIQ API no retry on timeout
+
+Find the NexusIQ HTTP call functions in `nexus_auto_fix.py`.
+Wrap the request calls (do not change the function signatures):
+
+```python
+def nexusiq_request_with_retry(url, headers, timeout=30, max_attempts=3):
+    """
+    Drop-in replacement for requests.get() calls to NexusIQ.
+    Returns response or None — never raises on network error.
+    """
+    import time
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt)
+            else:
+                return None
+        except requests.HTTPError as e:
+            return None
+    return None
+```
+
+-----
+
+## CONVERGENCE GUARD — for 10 iterations
+
+### Where it is
+
+`nexusiq_auto_vuln_fix.sh` — the while loop, around lines 18-19.
+
+### What to add
+
+After writing `fix_results.json` and before the
+“Any Unfixed Vulnerabilities?” routing decision, add:
+
+```bash
+# ── CONVERGENCE GUARD ─────────────────────────────────────────────
+# Stop early if no real progress was made this iteration.
+# This prevents burning all 10 iterations on repeated no-op runs.
+
+FIXES_THIS_ITER=$(python3 -c "
+import json
+with open('$FIX_RESULTS_FILE') as f:
+    r = json.load(f)
+print(len(r.get('fixed', [])))
+")
+
+if [ "$FIXES_THIS_ITER" -eq 0 ]; then
+    log "No fixes applied this iteration. Converged at iteration $CURRENT_ITERATION."
+    log "Remaining iterations ($((MAX_ITERATIONS - CURRENT_ITERATION))) released."
+    break   # exit while loop, proceed to commit whatever was fixed so far
+fi
+
+# ── CYCLE DETECTION ───────────────────────────────────────────────
+# Stop if this iteration fixed the exact same artifacts as last iteration
+# AND the previous build failed (rollback cycle).
+
+if [ -f "$ROLLBACK_FILE" ]; then
+    CYCLE=$(python3 -c "
+import json, os
+results_file = '$FIX_RESULTS_FILE'
+rollback_file = '$ROLLBACK_FILE'
+with open(results_file) as f:
+    current_gas = {d['group_id']+':'+d['artifact_id']
+                   for d in json.load(f).get('fixed', [])}
+with open(rollback_file) as f:
+    rolled_back = {line.strip().rsplit(':',1)[0] for line in f if line.strip()}
+print('yes' if current_gas and current_gas.issubset(rolled_back) else 'no')
+")
+    if [ "$CYCLE" = "yes" ]; then
+        log "Rollback cycle detected. These fixes were previously rolled back."
+        log "Routing to manual review."
+        break
+    fi
+fi
+
+CURRENT_ITERATION=$((CURRENT_ITERATION + 1))
+# ── END CONVERGENCE GUARD ─────────────────────────────────────────
+```
+
+-----
+
+## VERIFICATION CHECKLIST
+
+Complete every item before declaring done:
+
+```
+BUGS FIXED:
+  □ attempted_artifacts.txt now stores tier value, not just boolean
+  □ all_decisions_history.json accumulates across all iterations
+  □ collision_check() receives history_path parameter (default=None)
+  □ Three-way collision classification: apply / skip-idempotent / true-collision
+  □ filter_already_fixed_vulns() called only when iteration_num > 1
+  □ Rollback tracking file created and checked before re-applying fixes
+  □ MAX_ITERATIONS exit point is AFTER commit step (verified, not assumed)
+  □ Tier 3 BOM intercept in place — no direct version pin for BOM artifacts
+  □ BOM major version bump guard logs warning and adds to suppressed[]
+
+RUNTIME SAFETY:
+  □ ET.register_namespace() called before every POM write
+  □ Dry-run ET.fromstring() called after tostring(), before file write
+  □ safe_version_parse() wraps all Version() calls
+  □ nexusiq_request_with_retry() used for all NexusIQ HTTP calls
+
+CONVERGENCE (10 iterations):
+  □ Early exit when fixes_this_iter == 0
+  □ Early exit when rollback cycle detected
+  □ CURRENT_ITERATION counter increments correctly
+  □ Early exit still reaches commit step (does not discard good fixes)
+
+UNCHANGED — CONFIRM EXPLICITLY:
+  □ Iteration 1 path:                          UNTOUCHED
+  □ extract_nexus_mufg_m...sh:                 UNTOUCHED
+  □ repo_runtime_selector...py:                UNTOUCHED
+  □ automation_ui.py:                          UNTOUCHED
+  □ All deployment_status files:               UNTOUCHED
+  □ export_project.py / setup.py:              UNTOUCHED
+  □ All files in /tools /Veracode /work:       UNTOUCHED
+  □ Existing function signatures (all callers still compile): VERIFIED
+  □ Existing NexusIQ call sites (now use retry wrapper):      VERIFIED
+```
+
+-----
+
+## FINAL REPORT FORMAT
+
+When all changes are complete, provide exactly this and nothing else:
+
+```
+FILES CHANGED:
+  nexusiq_auto_vuln_fix.sh  → <functions/sections modified>
+  nexus_auto_fix.py         → <functions modified or added>
+
+BUGS FIXED:
+  Bug 1 (attempted_artifacts tier):  <one line>
+  Bug 2 (all_decisions_ever):        <one line>
+  Bug 3 (collision misclassify):     <one line>
+  Bug 4 (POM re-diff):               <one line>
+  Bug 5 (rollback cycle):            <one line>
+  Bug 6 (MAX_ITERATIONS + commit):   <one line>
+  BOM Tier 3 intercept:              <one line>
+
+RUNTIME SAFETY ADDED:
+  XML namespace:    <one line>
+  semver parser:    <one line>
+  NexusIQ retry:    <one line>
+
+CONVERGENCE (10 iterations):
+  Early stop:       <one line>
+  Cycle detection:  <one line>
+
+UNCHANGED (confirm):
+  Iteration 1:      UNTOUCHED
+  All other files:  UNTOUCHED
+
+ITERATION 2+ WILL NOW:
+  <two sentences describing the new behaviour>
+```
+
+-----
+
+*VUIAutomation · nexusiq_auto_vuln_fix.sh + nexus_auto_fix.py · Surgical patch only*
+*Based on: while loop structure, attempted_artifacts.txt/collision_state.txt persistence,*
+*fix_results.json per-iteration reset, bom_managed+patch_property carried through all tiers*
