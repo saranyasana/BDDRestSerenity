@@ -1,0 +1,1 @@
+“You are a Java architect. Analyze ALL vulnerabilities together. First consider if a Spring Boot version upgrade resolves the majority. Then handle remaining transitives — use exclusions where needed, explicit additions where necessary. Propose the minimum pom.xml changes that resolve everything.”
